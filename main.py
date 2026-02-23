@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
-from models import User, APIKey, UsageLog
+from database import SessionLocal, engine
+from models import Base, User, APIKey, UsageLog
 from services.resume_analyzer import analyze_resume
 
 
@@ -64,6 +64,7 @@ Pass your API key as the **`X-Api-Key`** request header on every analysis call.
     """,
     version="2.0.0",
 )
+Base.metadata.create_all(bind=engine)
 
 
 # ══════════════════════════════════════════════════════════════════
