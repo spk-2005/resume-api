@@ -1,6 +1,30 @@
+"""
+main.py  ─  Resume ATS Intelligence API  v3.0.0
+─────────────────────────────────────────────────
+Accepts resumes as any of:
+  • PDF   (text-based or scanned image PDF)
+  • DOCX / DOC  (Word documents, any number of pages)
+  • PNG / JPG / JPEG / WEBP / GIF  (resume screenshots)
+  • TXT   (plain text)
+
+Multi-format extraction pipeline:
+  ┌──────────────┬────────────────────────────────────────────┐
+  │ Format       │ Extraction Method                          │
+  ├──────────────┼────────────────────────────────────────────┤
+  │ .txt         │ Read bytes directly                        │
+  │ .pdf         │ pypdf  →  fallback: pdf2image + pytesseract│
+  │ .docx        │ python-docx  (all paragraphs + tables)     │
+  │ .doc         │ textract  (LibreOffice-based conversion)   │
+  │ .png/.jpg etc│ pytesseract OCR                            │
+  └──────────────┴────────────────────────────────────────────┘
+"""
+
 import io
+import os
 import uuid
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import (
@@ -16,12 +40,59 @@ from models import Base, User, APIKey, UsageLog
 from services.resume_analyzer import analyze_resume
 
 
-# ── PDF parser ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  OPTIONAL DEPENDENCY IMPORTS  (graceful degradation)
+# ══════════════════════════════════════════════════════════════════
+
+# ── PDF: text-based ───────────────────────────────────────────────
 try:
     from pypdf import PdfReader
-    PDF_SUPPORT = True
+    PYPDF_OK = True
 except ImportError:
-    PDF_SUPPORT = False
+    PYPDF_OK = False
+
+# ── PDF: scanned / image-only  →  OCR fallback ───────────────────
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    OCR_OK = True
+except ImportError:
+    OCR_OK = False
+
+# ── DOCX ──────────────────────────────────────────────────────────
+try:
+    import docx  # python-docx
+    DOCX_OK = True
+except ImportError:
+    DOCX_OK = False
+
+# ── DOC (old binary format) ───────────────────────────────────────
+try:
+    import textract
+    TEXTRACT_OK = True
+except ImportError:
+    TEXTRACT_OK = False
+
+# ── Images (PNG / JPG / WEBP …) ───────────────────────────────────
+try:
+    from PIL import Image
+    import pytesseract
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SUPPORTED EXTENSIONS
+# ══════════════════════════════════════════════════════════════════
+
+PDF_EXTS   = {".pdf"}
+DOCX_EXTS  = {".docx"}
+DOC_EXTS   = {".doc"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
+TEXT_EXTS  = {".txt"}
+
+ALL_SUPPORTED = PDF_EXTS | DOCX_EXTS | DOC_EXTS | IMAGE_EXTS | TEXT_EXTS
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -31,38 +102,31 @@ except ImportError:
 app = FastAPI(
     title="Resume ATS Intelligence API",
     description="""
-## Resume ATS Intelligence API
+## Resume ATS Intelligence API  v3.0.0
 
-Analyze resumes (PDF) against job descriptions with a full ATS score.
+Analyze resumes against job descriptions with a full ATS score.
+
+### Supported File Formats
+| Format | Notes |
+|--------|-------|
+| **PDF** | Text-based PDFs parsed directly; scanned/image PDFs auto-OCR'd via Tesseract |
+| **DOCX** | Word 2007+ documents, any number of pages |
+| **DOC** | Legacy Word format via textract/LibreOffice |
+| **PNG / JPG / JPEG / WEBP / GIF** | Resume screenshots via OCR |
+| **TXT** | Plain text |
 
 ### Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/create-user/` | Register and get an API key |
-| POST | `/analyze-resume-pdf/` | Single PDF → ATS report |
-| POST | `/bulk-analyze/` | Multiple PDFs → ranked list |
+| POST | `/analyze-resume/` | Single file → ATS report |
+| POST | `/bulk-analyze/` | Multiple files → ranked list |
 | GET  | `/usage/` | Check monthly usage |
 
 ### Authentication
-Pass your API key as the **`X-Api-Key`** request header on every analysis call.
-
-### ATS Report Fields
-| Field | Description |
-|---|---|
-| `ats_score` | 0–100 overall score |
-| `ats_rating` | Excellent / Good / Average / Below Average / Poor |
-| `score_breakdown` | Points earned per component |
-| `skill_match_percentage` | % of JD skills found in resume |
-| `matched_skills` | Skills in both resume and JD |
-| `missing_skills` | Skills JD requires but resume lacks |
-| `keyword_density` | How many times each required skill appears |
-| `sections_detected` | Which standard sections the resume has |
-| `power_verbs_found` | Action verbs detected |
-| `has_quantified_metrics` | Whether resume has numbers/% |
-| `format_checks` | Email, phone, LinkedIn, GitHub, word count |
-| `recommendations` | Prioritised fix list (HIGH → MEDIUM → LOW) |
+Pass your API key as the **`X-Api-Key`** request header.
     """,
-    version="2.0.0",
+    version="3.0.0",
 )
 Base.metadata.create_all(bind=engine)
 
@@ -105,49 +169,206 @@ def log_usage(user_id: int, db: Session):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PDF HELPERS
+#  MULTI-FORMAT TEXT EXTRACTION
 # ══════════════════════════════════════════════════════════════════
 
-def extract_pdf_text(file_bytes: bytes, filename: str = "resume.pdf") -> str:
+def _extract_pdf(file_bytes: bytes, filename: str) -> str:
     """
-    Extract plain text from PDF bytes.
-    - 501  →  pypdf not installed
-    - 422  →  corrupt PDF or scanned image (no text layer)
+    Extract text from a PDF.
+    Step 1: Try pypdf (fast, works on text-based PDFs).
+    Step 2: If no text is found → OCR with pdf2image + pytesseract.
     """
-    if not PDF_SUPPORT:
+    if not PYPDF_OK:
         raise HTTPException(
             status_code=501,
-            detail="PDF support not installed. Run: pip install pypdf",
+            detail="pypdf not installed. Run: pip install pypdf",
         )
+
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        pages  = [page.extract_text() or "" for page in reader.pages]
+        text   = "\n".join(pages).strip()
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Could not read '{filename}'. Ensure it is a valid PDF. Error: {exc}",
+            detail=f"Could not read '{filename}': {exc}",
         )
-    if not text.strip():
+
+    # Text found — return it
+    if text:
+        return text
+
+    # No text → scanned PDF, try OCR
+    if not OCR_OK:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"No text extracted from '{filename}'. "
-                "This is likely a scanned/image PDF. "
-                "Export your resume from Word or Google Docs as a PDF instead."
+                f"'{filename}' appears to be a scanned/image PDF with no text layer. "
+                "Install pdf2image and pytesseract to enable OCR: "
+                "`pip install pdf2image pytesseract` and install Tesseract."
+            ),
+        )
+
+    try:
+        images = convert_from_bytes(file_bytes, dpi=200)
+        ocr_pages = [pytesseract.image_to_string(img, lang="eng") for img in images]
+        text = "\n".join(ocr_pages).strip()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"OCR failed on '{filename}': {exc}",
+        )
+
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No text could be extracted from '{filename}' even after OCR. "
+                "Ensure the file is a readable PDF."
             ),
         )
     return text
 
 
+def _extract_docx(file_bytes: bytes, filename: str) -> str:
+    """Extract text from a .docx file (python-docx)."""
+    if not DOCX_OK:
+        raise HTTPException(
+            status_code=501,
+            detail="python-docx not installed. Run: pip install python-docx",
+        )
+    try:
+        document = docx.Document(io.BytesIO(file_bytes))
+        parts: List[str] = []
+
+        # Body paragraphs
+        for para in document.paragraphs:
+            parts.append(para.text)
+
+        # Tables (skills grids, contact tables, etc.)
+        for table in document.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    parts.append(cell.text)
+
+        # Headers & footers (sometimes contain contact info)
+        for section in document.sections:
+            for hdr_para in (section.header.paragraphs if section.header else []):
+                parts.append(hdr_para.text)
+            for ftr_para in (section.footer.paragraphs if section.footer else []):
+                parts.append(ftr_para.text)
+
+        text = "\n".join(p for p in parts if p.strip()).strip()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not read DOCX '{filename}': {exc}",
+        )
+
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No text extracted from '{filename}'. The document may be empty.",
+        )
+    return text
+
+
+def _extract_doc(file_bytes: bytes, filename: str) -> str:
+    """Extract text from a legacy .doc file via textract."""
+    if not TEXTRACT_OK:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "textract not installed. Run: pip install textract "
+                "(also requires LibreOffice on the server for .doc support)."
+            ),
+        )
+    try:
+        # textract needs a file on disk
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        text = textract.process(tmp_path).decode("utf-8", errors="replace").strip()
+        os.unlink(tmp_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not extract text from .doc '{filename}': {exc}",
+        )
+
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No text extracted from '{filename}'.",
+        )
+    return text
+
+
+def _extract_image(file_bytes: bytes, filename: str) -> str:
+    """Extract text from an image (PNG/JPG/WEBP…) via Tesseract OCR."""
+    if not PIL_OK:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Pillow / pytesseract not installed. "
+                "Run: pip install pillow pytesseract  (also install Tesseract binary)."
+            ),
+        )
+    try:
+        image = Image.open(io.BytesIO(file_bytes))
+        text  = pytesseract.image_to_string(image, lang="eng").strip()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"OCR failed on image '{filename}': {exc}",
+        )
+
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No text found in image '{filename}'. "
+                "Ensure the image is clear and the text is legible."
+            ),
+        )
+    return text
+
+
+def extract_text(file_bytes: bytes, filename: str) -> str:
+    """
+    Master dispatcher: routes to the right extractor based on file extension.
+    Raises HTTPException(422) if format is unsupported or extraction fails.
+    """
+    ext = Path(filename).suffix.lower()
+
+    if ext in TEXT_EXTS:
+        return file_bytes.decode("utf-8", errors="replace").strip()
+
+    if ext in PDF_EXTS:
+        return _extract_pdf(file_bytes, filename)
+
+    if ext in DOCX_EXTS:
+        return _extract_docx(file_bytes, filename)
+
+    if ext in DOC_EXTS:
+        return _extract_doc(file_bytes, filename)
+
+    if ext in IMAGE_EXTS:
+        return _extract_image(file_bytes, filename)
+
+    raise HTTPException(
+        status_code=415,
+        detail=(
+            f"Unsupported file type '{ext}'. "
+            f"Accepted: {', '.join(sorted(ALL_SUPPORTED))}"
+        ),
+    )
+
+
 def filename_to_name(filename: str) -> str:
     """'rahul_sharma_resume.pdf'  →  'Rahul Sharma Resume'"""
-    return (
-        filename
-        .replace(".pdf", "")
-        .replace("_", " ")
-        .replace("-", " ")
-        .title()
-    )
+    stem = Path(filename).stem
+    return stem.replace("_", " ").replace("-", " ").title()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -157,8 +378,8 @@ def filename_to_name(filename: str) -> str:
 @app.post("/create-user/", tags=["Auth"], summary="Register → get API key")
 def create_user(email: str, db: Session = Depends(get_db)):
     """
-    Register with your email. Returns an API key (basic plan = 50 req/month).
-    Use this key in the `X-Api-Key` header for all analysis endpoints.
+    Register with your email.  
+    Returns an API key (basic plan = 50 requests / month).
     """
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=400, detail="Account already exists for this email.")
@@ -199,68 +420,74 @@ def get_usage(x_api_key: str = Header(...), db: Session = Depends(get_db)):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SINGLE PDF ANALYSIS
+#  SINGLE FILE ANALYSIS  (replaces /analyze-resume-pdf/)
 # ══════════════════════════════════════════════════════════════════
 
 @app.post(
-    "/analyze-resume-pdf/",
+    "/analyze-resume/",
     tags=["Job Seeker"],
-    summary="Upload one PDF resume → full ATS report",
+    summary="Upload one resume (PDF/DOCX/DOC/Image/TXT) → full ATS report",
 )
-async def analyze_resume_pdf(
+async def analyze_resume_endpoint(
     job_description: str = Form(..., description="Paste the full job description text."),
-    resume_pdf: UploadFile = File(..., description="Your resume as a text-based PDF."),
-    candidate_name: Optional[str] = Form(None, description="Optional name. Defaults to filename."),
-    x_api_key: str = Header(..., description="API key from /create-user/"),
-    db: Session = Depends(get_db),
+    resume_file:     UploadFile = File(..., description="Resume file: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
+    candidate_name:  Optional[str] = Form(None, description="Optional. Defaults to filename."),
+    x_api_key:       str = Header(..., description="API key from /create-user/"),
+    db:              Session = Depends(get_db),
 ):
     """
-    Upload **one** PDF resume + paste the job description.
-    Returns the complete ATS analysis report.
+    Upload **one** resume file + paste the job description.
 
-    **Tips:**
-    - Export your resume from Word / Google Docs as PDF (not a scan).
+    ### Supported formats
+    `PDF` · `DOCX` · `DOC` · `PNG` · `JPG` · `JPEG` · `WEBP` · `TXT`
+
+    ### Scanned / image PDFs
+    Automatically OCR'd with Tesseract if no text layer is found.
+
+    ### Tips
     - Paste the **full** JD text for the most accurate skill matching.
+    - Multi-page documents are fully supported.
     """
-    user = get_authenticated_user(x_api_key, db)
+    user       = get_authenticated_user(x_api_key, db)
     log_usage(user.id, db)
 
-    pdf_bytes = await resume_pdf.read()
-    text      = extract_pdf_text(pdf_bytes, resume_pdf.filename)
-    name      = candidate_name or filename_to_name(resume_pdf.filename)
+    raw_bytes  = await resume_file.read()
+    text       = extract_text(raw_bytes, resume_file.filename)
+    name       = candidate_name or filename_to_name(resume_file.filename)
 
     return analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
 
 
+# ── Keep old endpoint alive for backwards compatibility ───────────
+@app.post(
+    "/analyze-resume-pdf/",
+    tags=["Job Seeker"],
+    summary="[Deprecated] Use /analyze-resume/ instead",
+    include_in_schema=False,   # hides from Swagger docs
+)
+async def analyze_resume_pdf_compat(
+    job_description: str = Form(...),
+    resume_pdf:      UploadFile = File(...),
+    candidate_name:  Optional[str] = Form(None),
+    x_api_key:       str = Header(...),
+    db:              Session = Depends(get_db),
+):
+    user      = get_authenticated_user(x_api_key, db)
+    log_usage(user.id, db)
+    raw_bytes = await resume_pdf.read()
+    text      = extract_text(raw_bytes, resume_pdf.filename)
+    name      = candidate_name or filename_to_name(resume_pdf.filename)
+    return analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
+
+
 # ══════════════════════════════════════════════════════════════════
-#  BULK PDF ANALYSIS  ← THE FIXED ENDPOINT
-# ══════════════════════════════════════════════════════════════════
-#
-#  ROOT CAUSE OF THE ORIGINAL BUG
-#  ───────────────────────────────
-#  FastAPI's  List[UploadFile] = File(...)  sends the correct Python
-#  type, but it emits an OpenAPI schema where the field type is
-#  "string/binary" (single file) — Swagger UI therefore renders a
-#  single-file picker and clients only send one file.
-#
-#  THE FIX
-#  ───────
-#  We override the auto-generated OpenAPI schema for this endpoint
-#  via  openapi_extra  so the field is described as:
-#       type: array, items: { type: string, format: binary }
-#  This tells Swagger UI to render the "Add item" multi-file picker.
-#  The FastAPI handler still receives  List[UploadFile]  correctly
-#  because the actual multipart parsing is unchanged — only the
-#  schema description changes.
-#
+#  BULK ANALYSIS  (PDF / DOCX / Images / TXT — any mix)
 # ══════════════════════════════════════════════════════════════════
 
 @app.post(
     "/bulk-analyze/",
     tags=["Hiring Team"],
-    summary="Upload multiple PDF resumes → ranked ATS candidate list",
-    # ↓ This overrides the OpenAPI schema for this specific endpoint.
-    # It fixes the Swagger UI to show a proper multi-file upload button.
+    summary="Upload multiple resumes (any format) → ranked ATS candidate list",
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -275,10 +502,9 @@ async def analyze_resume_pdf(
                                 "description": "Paste the full job description text.",
                             },
                             "resumes": {
-                                # KEY FIX: array of files, not a single file
-                                "type":  "array",
-                                "items": {"type": "string", "format": "binary"},
-                                "description": "Upload multiple PDF resume files.",
+                                "type":        "array",
+                                "items":       {"type": "string", "format": "binary"},
+                                "description": "Upload multiple resume files (PDF/DOCX/DOC/PNG/JPG/TXT). Any mix of formats.",
                             },
                         },
                     }
@@ -288,21 +514,22 @@ async def analyze_resume_pdf(
     },
 )
 async def bulk_analyze(
-    request: Request,                                          # raw request for manual parsing
+    request:   Request,
     x_api_key: str = Header(..., description="API key from /create-user/"),
-    db: Session = Depends(get_db),
+    db:        Session = Depends(get_db),
 ):
     """
     ## Bulk Resume Ranking — Hiring Team Mode
 
-    Upload **multiple PDF resumes** at once against one job description.
-    Every file is analyzed individually, then candidates are ranked by ATS score.
+    Upload **multiple resumes** (any mix of PDF, DOCX, DOC, PNG, JPG, TXT)
+    against one job description. Each file is analyzed individually,
+    then candidates are ranked by ATS score.
 
-    ### How to send files (3 options)
+    ### Sending files — 3 options
 
-    **Option A — Swagger UI**
-    Click "Try it out", fill in `job_description`, then click **"Add item"**
-    under `resumes` for each PDF you want to upload.
+    **Option A — Swagger UI**  
+    Click *Try it out*, fill `job_description`, then click **Add item** under
+    `resumes` for each file.
 
     **Option B — cURL**
     ```bash
@@ -310,35 +537,36 @@ async def bulk_analyze(
       -H "X-Api-Key: YOUR_KEY" \\
       -F "job_description=We need a Python developer..." \\
       -F "resumes=@rahul.pdf" \\
-      -F "resumes=@anita.pdf" \\
-      -F "resumes=@vikram.pdf"
+      -F "resumes=@anita.docx" \\
+      -F "resumes=@vikram_resume.png"
     ```
 
     **Option C — Python requests**
     ```python
     import requests
+
     files = [
-        ("resumes", ("rahul.pdf",  open("rahul.pdf",  "rb"), "application/pdf")),
-        ("resumes", ("anita.pdf",  open("anita.pdf",  "rb"), "application/pdf")),
-        ("resumes", ("vikram.pdf", open("vikram.pdf", "rb"), "application/pdf")),
+        ("resumes", ("rahul.pdf",   open("rahul.pdf",   "rb"), "application/pdf")),
+        ("resumes", ("anita.docx",  open("anita.docx",  "rb"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+        ("resumes", ("vikram.png",  open("vikram.png",  "rb"), "image/png")),
     ]
-    data   = {"job_description": "We need a Python developer..."}
-    headers= {"X-Api-Key": "YOUR_KEY"}
-    r = requests.post("http://localhost:8000/bulk-analyze/", files=files, data=data, headers=headers)
+    r = requests.post(
+        "http://localhost:8000/bulk-analyze/",
+        files=files,
+        data={"job_description": "We need a Python developer..."},
+        headers={"X-Api-Key": "YOUR_KEY"},
+    )
     print(r.json())
     ```
 
     ### Returns
-    - `summary` — quick stats: total, analyzed, failed, shortlisted (≥70)
+    - `summary` — totals, shortlisted (≥70), top candidate
     - `ranked_candidates` — full ATS report per candidate, sorted highest → lowest
-    - `failed_files` — any PDFs that could not be parsed
+    - `failed_files` — any files that could not be parsed, with reasons
     """
     user = get_authenticated_user(x_api_key, db)
 
-    # ── Parse raw multipart form manually ─────────────────────────
-    # We do this because FastAPI's automatic List[UploadFile] injection
-    # works at runtime but breaks Swagger's schema (as explained above).
-    # Using request.form() gives us full control over both.
+    # ── Parse raw multipart ────────────────────────────────────────
     try:
         form = await request.form()
     except Exception:
@@ -351,47 +579,40 @@ async def bulk_analyze(
     if not job_description:
         raise HTTPException(status_code=422, detail="Field 'job_description' is required.")
 
-    # Collect all uploaded files — getlist handles multiple values with same key
     resume_files: List[UploadFile] = form.getlist("resumes")
+    resume_files = [f for f in resume_files if hasattr(f, "read")]
     if not resume_files:
         raise HTTPException(
             status_code=422,
             detail=(
                 "No resume files received. "
-                "Send files as multipart form fields all named 'resumes'. "
-                "See the endpoint description for cURL / Python examples."
+                "Send files as multipart fields all named 'resumes'. "
+                "Supported: PDF, DOCX, DOC, PNG, JPG, WEBP, TXT."
             ),
         )
 
-    # Filter out any non-UploadFile entries (e.g. stray string values)
-    resume_files = [f for f in resume_files if hasattr(f, "read")]
-    if not resume_files:
-        raise HTTPException(
-            status_code=422,
-            detail="Files were not received as binary uploads. Check your request format.",
-        )
-
-    # ── Pre-flight usage limit check ──────────────────────────────
+    # ── Usage pre-flight ───────────────────────────────────────────
     used      = _usage_this_month(user.id, db)
     remaining = user.monthly_limit - used
     if len(resume_files) > remaining:
         raise HTTPException(
             status_code=403,
             detail=(
-                f"This upload has {len(resume_files)} files but you only have "
+                f"Upload has {len(resume_files)} files but you only have "
                 f"{remaining} requests remaining this month."
             ),
         )
 
-    # ── Analyze each file ─────────────────────────────────────────
+    # ── Process each file ─────────────────────────────────────────
     results: List[dict] = []
     errors:  List[dict] = []
 
     for resume_file in resume_files:
-        candidate_name = filename_to_name(resume_file.filename or "unknown.pdf")
+        fname = resume_file.filename or "unknown"
+        candidate_name = filename_to_name(fname)
         try:
-            pdf_bytes = await resume_file.read()
-            text      = extract_pdf_text(pdf_bytes, resume_file.filename)
+            raw_bytes = await resume_file.read()
+            text      = extract_text(raw_bytes, fname)
             report    = analyze_resume(
                 resume_text=text,
                 job_description=job_description,
@@ -400,24 +621,19 @@ async def bulk_analyze(
             results.append(report)
             log_usage(user.id, db)
         except HTTPException as exc:
-            # File failed — record error, don't charge quota, continue with others
-            errors.append({"file": resume_file.filename, "error": exc.detail})
+            errors.append({"file": fname, "error": exc.detail})
 
     if not results and errors:
         raise HTTPException(
             status_code=422,
-            detail={
-                "message": "All uploaded files failed to process.",
-                "errors":  errors,
-            },
+            detail={"message": "All uploaded files failed to process.", "errors": errors},
         )
 
-    # ── Rank and return ───────────────────────────────────────────
+    # ── Rank ──────────────────────────────────────────────────────
     ranked      = sorted(results, key=lambda r: r["ats_score"], reverse=True)
     shortlisted = [r for r in ranked if r["ats_score"] >= 70]
 
     return {
-        # Quick summary for HR dashboard display
         "summary": {
             "total_uploaded":        len(resume_files),
             "successfully_analyzed": len(ranked),
@@ -426,8 +642,6 @@ async def bulk_analyze(
             "top_candidate":         ranked[0]["candidate_name"] if ranked else None,
             "top_ats_score":         ranked[0]["ats_score"]      if ranked else None,
         },
-
-        # Full ATS report per candidate, ranked 1st to last
         "ranked_candidates": [
             {
                 "rank":                   i + 1,
@@ -448,7 +662,5 @@ async def bulk_analyze(
             }
             for i, r in enumerate(ranked)
         ],
-
-        # Files that failed parsing (scanned PDFs, corrupt files, etc.)
         "failed_files": errors,
     }
