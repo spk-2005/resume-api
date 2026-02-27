@@ -6,17 +6,6 @@ Accepts resumes as any of:
   • DOCX / DOC  (Word documents, any number of pages)
   • PNG / JPG / JPEG / WEBP / GIF  (resume screenshots)
   • TXT   (plain text)
-
-Multi-format extraction pipeline:
-  ┌──────────────┬────────────────────────────────────────────┐
-  │ Format       │ Extraction Method                          │
-  ├──────────────┼────────────────────────────────────────────┤
-  │ .txt         │ Read bytes directly                        │
-  │ .pdf         │ pypdf  →  fallback: pdf2image + pytesseract│
-  │ .docx        │ python-docx  (all paragraphs + tables)     │
-  │ .doc         │ textract  (LibreOffice-based conversion)   │
-  │ .png/.jpg etc│ pytesseract OCR                            │
-  └──────────────┴────────────────────────────────────────────┘
 """
 
 import io
@@ -29,9 +18,8 @@ from typing import List, Optional
 
 from fastapi import (
     FastAPI, Depends, HTTPException,
-    UploadFile, File, Form, Request, Security
+    UploadFile, File, Form, Request
 )
-from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -45,14 +33,12 @@ from services.resume_analyzer import analyze_resume
 #  OPTIONAL DEPENDENCY IMPORTS  (graceful degradation)
 # ══════════════════════════════════════════════════════════════════
 
-# ── PDF: text-based ───────────────────────────────────────────────
 try:
     from pypdf import PdfReader
     PYPDF_OK = True
 except ImportError:
     PYPDF_OK = False
 
-# ── PDF: scanned / image-only  →  OCR fallback ───────────────────
 try:
     from pdf2image import convert_from_bytes
     import pytesseract
@@ -60,21 +46,18 @@ try:
 except ImportError:
     OCR_OK = False
 
-# ── DOCX ──────────────────────────────────────────────────────────
 try:
-    import docx  # python-docx
+    import docx
     DOCX_OK = True
 except ImportError:
     DOCX_OK = False
 
-# ── DOC (old binary format) ───────────────────────────────────────
 try:
     import textract
     TEXTRACT_OK = True
 except ImportError:
     TEXTRACT_OK = False
 
-# ── Images (PNG / JPG / WEBP …) ───────────────────────────────────
 try:
     from PIL import Image
     import pytesseract
@@ -107,10 +90,13 @@ app = FastAPI(
 
 Analyze resumes against job descriptions with a full ATS score.
 
+### Authentication
+Pass your API key as the **`X-RapidAPI-Key`** request header.
+
 ### Supported File Formats
 | Format | Notes |
 |--------|-------|
-| **PDF** | Text-based PDFs parsed directly; scanned/image PDFs auto-OCR'd via Tesseract |
+| **PDF** | Text-based PDFs parsed directly; scanned/image PDFs auto-OCR'd |
 | **DOCX** | Word 2007+ documents, any number of pages |
 | **DOC** | Legacy Word format via textract/LibreOffice |
 | **PNG / JPG / JPEG / WEBP / GIF** | Resume screenshots via OCR |
@@ -123,9 +109,6 @@ Analyze resumes against job descriptions with a full ATS score.
 | POST | `/analyze-resume/` | Single file → ATS report |
 | POST | `/bulk-analyze/` | Multiple files → ranked list |
 | GET  | `/usage/` | Check monthly usage |
-
-### Authentication
-Pass your API key as the **`X-RapidAPI-Key`** request header.
     """,
     version="3.0.0",
 )
@@ -133,16 +116,7 @@ Base.metadata.create_all(bind=engine)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  API KEY SECURITY SCHEME
-#  Using APIKeyHeader ensures FastAPI declares the header correctly
-#  so RapidAPI's proxy and FastAPI validation agree on the name.
-# ══════════════════════════════════════════════════════════════════
-
-api_key_header = APIKeyHeader(name="X-RapidAPI-Key", auto_error=True)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  DB + AUTH HELPERS
+#  DB HELPER
 # ══════════════════════════════════════════════════════════════════
 
 def get_db():
@@ -153,6 +127,45 @@ def get_db():
         db.close()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  AUTH HELPER
+#
+#  WHY we read from Request directly instead of Header() / Security():
+#  ─────────────────────────────────────────────────────────────────
+#  FastAPI's Header() and APIKeyHeader() both validate the header
+#  at the parameter-binding stage and raise 422/401 before our code
+#  even runs — but RapidAPI's proxy sometimes lowercases headers or
+#  sends the key under a slightly different casing, causing false
+#  failures.
+#
+#  Reading from request.headers (a case-insensitive dict in Starlette)
+#  lets us check every variant in one place without triggering
+#  FastAPI's early-exit validation.
+#
+#  Headers checked (in priority order):
+#    1. x-rapidapi-key   ← RapidAPI standard proxy header
+#    2. x-api-key        ← direct callers / local testing
+# ══════════════════════════════════════════════════════════════════
+
+_KEY_HEADERS = ["x-rapidapi-key", "x-api-key"]
+
+
+def _get_raw_api_key(request: Request) -> str:
+    """Extract API key from headers. Starlette headers are case-insensitive."""
+    for h in _KEY_HEADERS:
+        val = request.headers.get(h)
+        if val:
+            return val.strip()
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "API key missing. "
+            "Send your key in the 'X-RapidAPI-Key' header. "
+            "Register at /create-user/ to get a key."
+        ),
+    )
+
+
 def _usage_this_month(user_id: int, db: Session) -> int:
     return db.query(UsageLog).filter(
         UsageLog.user_id == user_id,
@@ -160,19 +173,18 @@ def _usage_this_month(user_id: int, db: Session) -> int:
     ).count()
 
 
-def get_authenticated_user(
-    x_api_key: str = Security(api_key_header),
-    db: Session = Depends(get_db),
-) -> User:
+def get_authenticated_user(request: Request, db: Session = Depends(get_db)) -> User:
     """
-    Shared auth dependency used by all protected endpoints.
-    Reads X-RapidAPI-Key header, validates it, and checks monthly limits.
+    Dependency used by all protected endpoints.
+    Extracts key → validates → enforces monthly limit → returns User.
     """
-    key = db.query(APIKey).filter(APIKey.api_key == x_api_key).first()
-    if not key:
+    api_key = _get_raw_api_key(request)
+
+    key_row = db.query(APIKey).filter(APIKey.api_key == api_key).first()
+    if not key_row:
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
-    user = db.query(User).filter(User.id == key.user_id).first()
+    user = db.query(User).filter(User.id == key_row.user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found for this API key.")
 
@@ -194,115 +206,74 @@ def log_usage(user_id: int, db: Session):
 # ══════════════════════════════════════════════════════════════════
 
 def _extract_pdf(file_bytes: bytes, filename: str) -> str:
-    """
-    Extract text from a PDF.
-    Step 1: Try pypdf (fast, works on text-based PDFs).
-    Step 2: If no text is found → OCR with pdf2image + pytesseract.
-    """
     if not PYPDF_OK:
-        raise HTTPException(
-            status_code=501,
-            detail="pypdf not installed. Run: pip install pypdf",
-        )
+        raise HTTPException(status_code=501, detail="pypdf not installed. Run: pip install pypdf")
 
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         pages  = [page.extract_text() or "" for page in reader.pages]
         text   = "\n".join(pages).strip()
     except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not read '{filename}': {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"Could not read '{filename}': {exc}")
 
-    # Text found — return it
     if text:
         return text
 
-    # No text → scanned PDF, try OCR
+    # Scanned PDF — try OCR
     if not OCR_OK:
         raise HTTPException(
             status_code=422,
             detail=(
                 f"'{filename}' appears to be a scanned/image PDF with no text layer. "
-                "Install pdf2image and pytesseract to enable OCR: "
-                "`pip install pdf2image pytesseract` and install Tesseract."
+                "Install pdf2image and pytesseract to enable OCR."
             ),
         )
-
     try:
         images    = convert_from_bytes(file_bytes, dpi=200)
         ocr_pages = [pytesseract.image_to_string(img, lang="eng") for img in images]
         text      = "\n".join(ocr_pages).strip()
     except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"OCR failed on '{filename}': {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"OCR failed on '{filename}': {exc}")
 
     if not text:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"No text could be extracted from '{filename}' even after OCR. "
-                "Ensure the file is a readable PDF."
-            ),
+            detail=f"No text could be extracted from '{filename}' even after OCR.",
         )
     return text
 
 
 def _extract_docx(file_bytes: bytes, filename: str) -> str:
-    """Extract text from a .docx file (python-docx)."""
     if not DOCX_OK:
-        raise HTTPException(
-            status_code=501,
-            detail="python-docx not installed. Run: pip install python-docx",
-        )
+        raise HTTPException(status_code=501, detail="python-docx not installed. Run: pip install python-docx")
     try:
         document = docx.Document(io.BytesIO(file_bytes))
         parts: List[str] = []
-
-        # Body paragraphs
         for para in document.paragraphs:
             parts.append(para.text)
-
-        # Tables (skills grids, contact tables, etc.)
         for table in document.tables:
             for row in table.rows:
                 for cell in row.cells:
                     parts.append(cell.text)
-
-        # Headers & footers (sometimes contain contact info)
         for section in document.sections:
             for hdr_para in (section.header.paragraphs if section.header else []):
                 parts.append(hdr_para.text)
             for ftr_para in (section.footer.paragraphs if section.footer else []):
                 parts.append(ftr_para.text)
-
         text = "\n".join(p for p in parts if p.strip()).strip()
     except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not read DOCX '{filename}': {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"Could not read DOCX '{filename}': {exc}")
 
     if not text:
-        raise HTTPException(
-            status_code=422,
-            detail=f"No text extracted from '{filename}'. The document may be empty.",
-        )
+        raise HTTPException(status_code=422, detail=f"No text extracted from '{filename}'. The document may be empty.")
     return text
 
 
 def _extract_doc(file_bytes: bytes, filename: str) -> str:
-    """Extract text from a legacy .doc file via textract."""
     if not TEXTRACT_OK:
         raise HTTPException(
             status_code=501,
-            detail=(
-                "textract not installed. Run: pip install textract "
-                "(also requires LibreOffice on the server for .doc support)."
-            ),
+            detail="textract not installed. Run: pip install textract (also requires LibreOffice).",
         )
     try:
         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
@@ -311,88 +282,60 @@ def _extract_doc(file_bytes: bytes, filename: str) -> str:
         text = textract.process(tmp_path).decode("utf-8", errors="replace").strip()
         os.unlink(tmp_path)
     except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not extract text from .doc '{filename}': {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"Could not extract text from .doc '{filename}': {exc}")
 
     if not text:
-        raise HTTPException(
-            status_code=422,
-            detail=f"No text extracted from '{filename}'.",
-        )
+        raise HTTPException(status_code=422, detail=f"No text extracted from '{filename}'.")
     return text
 
 
 def _extract_image(file_bytes: bytes, filename: str) -> str:
-    """Extract text from an image (PNG/JPG/WEBP…) via Tesseract OCR."""
     if not PIL_OK:
         raise HTTPException(
             status_code=501,
-            detail=(
-                "Pillow / pytesseract not installed. "
-                "Run: pip install pillow pytesseract  (also install Tesseract binary)."
-            ),
+            detail="Pillow / pytesseract not installed. Run: pip install pillow pytesseract",
         )
     try:
         image = Image.open(io.BytesIO(file_bytes))
         text  = pytesseract.image_to_string(image, lang="eng").strip()
     except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"OCR failed on image '{filename}': {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"OCR failed on image '{filename}': {exc}")
 
     if not text:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"No text found in image '{filename}'. "
-                "Ensure the image is clear and the text is legible."
-            ),
+            detail=f"No text found in image '{filename}'. Ensure the image is clear and legible.",
         )
     return text
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
-    """
-    Master dispatcher: routes to the right extractor based on file extension.
-    Raises HTTPException(422) if format is unsupported or extraction fails.
-    """
     ext = Path(filename).suffix.lower()
 
     if ext in TEXT_EXTS:
         return file_bytes.decode("utf-8", errors="replace").strip()
-
     if ext in PDF_EXTS:
         return _extract_pdf(file_bytes, filename)
-
     if ext in DOCX_EXTS:
         return _extract_docx(file_bytes, filename)
-
     if ext in DOC_EXTS:
         return _extract_doc(file_bytes, filename)
-
     if ext in IMAGE_EXTS:
         return _extract_image(file_bytes, filename)
 
     raise HTTPException(
         status_code=415,
-        detail=(
-            f"Unsupported file type '{ext}'. "
-            f"Accepted: {', '.join(sorted(ALL_SUPPORTED))}"
-        ),
+        detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(ALL_SUPPORTED))}",
     )
 
 
 def filename_to_name(filename: str) -> str:
-    """'rahul_sharma_resume.pdf'  →  'Rahul Sharma Resume'"""
     stem = Path(filename).stem
     return stem.replace("_", " ").replace("-", " ").title()
 
 
 # ══════════════════════════════════════════════════════════════════
-#  AUTH ENDPOINTS
+#  PUBLIC ENDPOINT — no auth required
 # ══════════════════════════════════════════════════════════════════
 
 @app.post("/create-user/", tags=["Auth"], summary="Register → get API key")
@@ -400,7 +343,7 @@ def create_user(email: str, db: Session = Depends(get_db)):
     """
     Register with your email.
     Returns an API key (basic plan = 50 requests / month).
-    No authentication required for this endpoint.
+    No authentication required.
     """
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=400, detail="Account already exists for this email.")
@@ -424,10 +367,14 @@ def create_user(email: str, db: Session = Depends(get_db)):
     }
 
 
+# ══════════════════════════════════════════════════════════════════
+#  PROTECTED ENDPOINTS — require X-RapidAPI-Key header
+# ══════════════════════════════════════════════════════════════════
+
 @app.get("/usage/", tags=["Auth"], summary="Check monthly usage")
 def get_usage(
-    user: User = Depends(get_authenticated_user),
-    db: Session = Depends(get_db),
+    user: User    = Depends(get_authenticated_user),
+    db:   Session = Depends(get_db),
 ):
     """Check how many requests you have used and how many remain this month."""
     used = _usage_this_month(user.id, db)
@@ -440,20 +387,17 @@ def get_usage(
     }
 
 
-# ══════════════════════════════════════════════════════════════════
-#  SINGLE FILE ANALYSIS
-# ══════════════════════════════════════════════════════════════════
-
 @app.post(
     "/analyze-resume/",
     tags=["Job Seeker"],
     summary="Upload one resume (PDF/DOCX/DOC/Image/TXT) → full ATS report",
 )
 async def analyze_resume_endpoint(
-    job_description: str = Form(..., description="Paste the full job description text."),
-    resume_file:     UploadFile = File(..., description="Resume file: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
-    candidate_name:  Optional[str] = Form(None, description="Optional. Defaults to filename."),
-    user: User = Depends(get_authenticated_user),
+    request:         Request,
+    job_description: str          = Form(..., description="Paste the full job description text."),
+    resume_file:     UploadFile   = File(..., description="Resume file: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
+    candidate_name:  Optional[str]= Form(None, description="Optional. Defaults to filename."),
+    user: User    = Depends(get_authenticated_user),
     db:   Session = Depends(get_db),
 ):
     """
@@ -464,21 +408,14 @@ async def analyze_resume_endpoint(
 
     ### Scanned / image PDFs
     Automatically OCR'd with Tesseract if no text layer is found.
-
-    ### Tips
-    - Paste the **full** JD text for the most accurate skill matching.
-    - Multi-page documents are fully supported.
     """
     log_usage(user.id, db)
-
     raw_bytes = await resume_file.read()
     text      = extract_text(raw_bytes, resume_file.filename)
     name      = candidate_name or filename_to_name(resume_file.filename)
-
     return analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
 
 
-# ── Keep old endpoint alive for backwards compatibility ───────────
 @app.post(
     "/analyze-resume-pdf/",
     tags=["Job Seeker"],
@@ -486,10 +423,11 @@ async def analyze_resume_endpoint(
     include_in_schema=False,
 )
 async def analyze_resume_pdf_compat(
-    job_description: str = Form(...),
-    resume_pdf:      UploadFile = File(...),
-    candidate_name:  Optional[str] = Form(None),
-    user: User = Depends(get_authenticated_user),
+    request:         Request,
+    job_description: str          = Form(...),
+    resume_pdf:      UploadFile   = File(...),
+    candidate_name:  Optional[str]= Form(None),
+    user: User    = Depends(get_authenticated_user),
     db:   Session = Depends(get_db),
 ):
     log_usage(user.id, db)
@@ -498,10 +436,6 @@ async def analyze_resume_pdf_compat(
     name      = candidate_name or filename_to_name(resume_pdf.filename)
     return analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
 
-
-# ══════════════════════════════════════════════════════════════════
-#  BULK ANALYSIS  (PDF / DOCX / Images / TXT — any mix)
-# ══════════════════════════════════════════════════════════════════
 
 @app.post(
     "/bulk-analyze/",
@@ -523,7 +457,7 @@ async def analyze_resume_pdf_compat(
                             "resumes": {
                                 "type":        "array",
                                 "items":       {"type": "string", "format": "binary"},
-                                "description": "Upload multiple resume files (PDF/DOCX/DOC/PNG/JPG/TXT). Any mix of formats.",
+                                "description": "Upload multiple resume files. Any mix of PDF/DOCX/DOC/PNG/JPG/TXT.",
                             },
                         },
                     }
@@ -534,40 +468,31 @@ async def analyze_resume_pdf_compat(
 )
 async def bulk_analyze(
     request: Request,
-    user: User = Depends(get_authenticated_user),
+    user: User    = Depends(get_authenticated_user),
     db:   Session = Depends(get_db),
 ):
     """
     ## Bulk Resume Ranking — Hiring Team Mode
 
     Upload **multiple resumes** (any mix of PDF, DOCX, DOC, PNG, JPG, TXT)
-    against one job description. Each file is analyzed individually,
-    then candidates are ranked by ATS score.
+    against one job description. Candidates are ranked by ATS score.
 
-    ### Sending files — 3 options
-
-    **Option A — Swagger UI**
-    Click *Try it out*, fill `job_description`, then click **Add item** under
-    `resumes` for each file.
-
-    **Option B — cURL**
+    ### cURL example
     ```bash
     curl -X POST http://localhost:8000/bulk-analyze/ \\
       -H "X-RapidAPI-Key: YOUR_KEY" \\
       -F "job_description=We need a Python developer..." \\
       -F "resumes=@rahul.pdf" \\
-      -F "resumes=@anita.docx" \\
-      -F "resumes=@vikram_resume.png"
+      -F "resumes=@anita.docx"
     ```
 
-    **Option C — Python requests**
+    ### Python example
     ```python
     import requests
-
     files = [
         ("resumes", ("rahul.pdf",  open("rahul.pdf",  "rb"), "application/pdf")),
-        ("resumes", ("anita.docx", open("anita.docx", "rb"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
-        ("resumes", ("vikram.png", open("vikram.png", "rb"), "image/png")),
+        ("resumes", ("anita.docx", open("anita.docx", "rb"),
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
     ]
     r = requests.post(
         "http://localhost:8000/bulk-analyze/",
@@ -577,13 +502,8 @@ async def bulk_analyze(
     )
     print(r.json())
     ```
-
-    ### Returns
-    - `summary` — totals, shortlisted (≥70), top candidate
-    - `ranked_candidates` — full ATS report per candidate, sorted highest → lowest
-    - `failed_files` — any files that could not be parsed, with reasons
     """
-    # ── Parse raw multipart ────────────────────────────────────────
+    # Parse raw multipart (auth already done via Depends above)
     try:
         form = await request.form()
     except Exception:
@@ -608,7 +528,7 @@ async def bulk_analyze(
             ),
         )
 
-    # ── Usage pre-flight ───────────────────────────────────────────
+    # Usage pre-flight
     used      = _usage_this_month(user.id, db)
     remaining = user.monthly_limit - used
     if len(resume_files) > remaining:
@@ -620,7 +540,7 @@ async def bulk_analyze(
             ),
         )
 
-    # ── Process each file ─────────────────────────────────────────
+    # Process each file
     results: List[dict] = []
     errors:  List[dict] = []
 
@@ -646,7 +566,6 @@ async def bulk_analyze(
             detail={"message": "All uploaded files failed to process.", "errors": errors},
         )
 
-    # ── Rank ──────────────────────────────────────────────────────
     ranked      = sorted(results, key=lambda r: r["ats_score"], reverse=True)
     shortlisted = [r for r in ranked if r["ats_score"] >= 70]
 
