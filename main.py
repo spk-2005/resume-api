@@ -29,8 +29,9 @@ from typing import List, Optional
 
 from fastapi import (
     FastAPI, Depends, HTTPException,
-    Header, UploadFile, File, Form, Request
+    UploadFile, File, Form, Request, Security
 )
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -124,11 +125,20 @@ Analyze resumes against job descriptions with a full ATS score.
 | GET  | `/usage/` | Check monthly usage |
 
 ### Authentication
-Pass your API key as the **`X-Api-Key`** request header.
+Pass your API key as the **`X-RapidAPI-Key`** request header.
     """,
     version="3.0.0",
 )
 Base.metadata.create_all(bind=engine)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  API KEY SECURITY SCHEME
+#  Using APIKeyHeader ensures FastAPI declares the header correctly
+#  so RapidAPI's proxy and FastAPI validation agree on the name.
+# ══════════════════════════════════════════════════════════════════
+
+api_key_header = APIKeyHeader(name="X-RapidAPI-Key", auto_error=True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -150,11 +160,22 @@ def _usage_this_month(user_id: int, db: Session) -> int:
     ).count()
 
 
-def get_authenticated_user(x_api_key: str, db: Session) -> User:
+def get_authenticated_user(
+    x_api_key: str = Security(api_key_header),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Shared auth dependency used by all protected endpoints.
+    Reads X-RapidAPI-Key header, validates it, and checks monthly limits.
+    """
     key = db.query(APIKey).filter(APIKey.api_key == x_api_key).first()
     if not key:
         raise HTTPException(status_code=401, detail="Invalid API key.")
+
     user = db.query(User).filter(User.id == key.user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found for this API key.")
+
     if _usage_this_month(user.id, db) >= user.monthly_limit:
         raise HTTPException(
             status_code=403,
@@ -210,9 +231,9 @@ def _extract_pdf(file_bytes: bytes, filename: str) -> str:
         )
 
     try:
-        images = convert_from_bytes(file_bytes, dpi=200)
+        images    = convert_from_bytes(file_bytes, dpi=200)
         ocr_pages = [pytesseract.image_to_string(img, lang="eng") for img in images]
-        text = "\n".join(ocr_pages).strip()
+        text      = "\n".join(ocr_pages).strip()
     except Exception as exc:
         raise HTTPException(
             status_code=422,
@@ -284,7 +305,6 @@ def _extract_doc(file_bytes: bytes, filename: str) -> str:
             ),
         )
     try:
-        # textract needs a file on disk
         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
@@ -378,8 +398,9 @@ def filename_to_name(filename: str) -> str:
 @app.post("/create-user/", tags=["Auth"], summary="Register → get API key")
 def create_user(email: str, db: Session = Depends(get_db)):
     """
-    Register with your email.  
+    Register with your email.
     Returns an API key (basic plan = 50 requests / month).
+    No authentication required for this endpoint.
     """
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=400, detail="Account already exists for this email.")
@@ -399,16 +420,16 @@ def create_user(email: str, db: Session = Depends(get_db)):
         "plan":          "basic",
         "monthly_limit": 50,
         "api_key":       api_key,
-        "tip":           "Send your api_key in the X-Api-Key header on every analysis request.",
+        "tip":           "Send your api_key in the X-RapidAPI-Key header on every analysis request.",
     }
 
 
 @app.get("/usage/", tags=["Auth"], summary="Check monthly usage")
-def get_usage(x_api_key: str = Header(..., alias="X-RapidAPI-Key"), db: Session = Depends(get_db)):
-    key = db.query(APIKey).filter(APIKey.api_key == x_api_key).first()
-    if not key:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-    user = db.query(User).filter(User.id == key.user_id).first()
+def get_usage(
+    user: User = Depends(get_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    """Check how many requests you have used and how many remain this month."""
     used = _usage_this_month(user.id, db)
     return {
         "email":           user.email,
@@ -420,7 +441,7 @@ def get_usage(x_api_key: str = Header(..., alias="X-RapidAPI-Key"), db: Session 
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SINGLE FILE ANALYSIS  (replaces /analyze-resume-pdf/)
+#  SINGLE FILE ANALYSIS
 # ══════════════════════════════════════════════════════════════════
 
 @app.post(
@@ -432,8 +453,8 @@ async def analyze_resume_endpoint(
     job_description: str = Form(..., description="Paste the full job description text."),
     resume_file:     UploadFile = File(..., description="Resume file: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
     candidate_name:  Optional[str] = Form(None, description="Optional. Defaults to filename."),
-    x_api_key: str = Header(..., alias="X-RapidAPI-Key", description="API key from /create-user/"),
-    db:              Session = Depends(get_db),
+    user: User = Depends(get_authenticated_user),
+    db:   Session = Depends(get_db),
 ):
     """
     Upload **one** resume file + paste the job description.
@@ -448,12 +469,11 @@ async def analyze_resume_endpoint(
     - Paste the **full** JD text for the most accurate skill matching.
     - Multi-page documents are fully supported.
     """
-    user       = get_authenticated_user(x_api_key, db)
     log_usage(user.id, db)
 
-    raw_bytes  = await resume_file.read()
-    text       = extract_text(raw_bytes, resume_file.filename)
-    name       = candidate_name or filename_to_name(resume_file.filename)
+    raw_bytes = await resume_file.read()
+    text      = extract_text(raw_bytes, resume_file.filename)
+    name      = candidate_name or filename_to_name(resume_file.filename)
 
     return analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
 
@@ -463,16 +483,15 @@ async def analyze_resume_endpoint(
     "/analyze-resume-pdf/",
     tags=["Job Seeker"],
     summary="[Deprecated] Use /analyze-resume/ instead",
-    include_in_schema=False,   # hides from Swagger docs
+    include_in_schema=False,
 )
 async def analyze_resume_pdf_compat(
     job_description: str = Form(...),
     resume_pdf:      UploadFile = File(...),
     candidate_name:  Optional[str] = Form(None),
-    x_api_key: str = Header(..., alias="X-RapidAPI-Key"),
-    db:              Session = Depends(get_db),
+    user: User = Depends(get_authenticated_user),
+    db:   Session = Depends(get_db),
 ):
-    user      = get_authenticated_user(x_api_key, db)
     log_usage(user.id, db)
     raw_bytes = await resume_pdf.read()
     text      = extract_text(raw_bytes, resume_pdf.filename)
@@ -514,9 +533,9 @@ async def analyze_resume_pdf_compat(
     },
 )
 async def bulk_analyze(
-    request:   Request,
-    x_api_key: str = Header(..., alias="X-RapidAPI-Key",description="API key from /create-user/"),
-    db:        Session = Depends(get_db),
+    request: Request,
+    user: User = Depends(get_authenticated_user),
+    db:   Session = Depends(get_db),
 ):
     """
     ## Bulk Resume Ranking — Hiring Team Mode
@@ -527,14 +546,14 @@ async def bulk_analyze(
 
     ### Sending files — 3 options
 
-    **Option A — Swagger UI**  
+    **Option A — Swagger UI**
     Click *Try it out*, fill `job_description`, then click **Add item** under
     `resumes` for each file.
 
     **Option B — cURL**
     ```bash
     curl -X POST http://localhost:8000/bulk-analyze/ \\
-      -H "X-Api-Key: YOUR_KEY" \\
+      -H "X-RapidAPI-Key: YOUR_KEY" \\
       -F "job_description=We need a Python developer..." \\
       -F "resumes=@rahul.pdf" \\
       -F "resumes=@anita.docx" \\
@@ -546,15 +565,15 @@ async def bulk_analyze(
     import requests
 
     files = [
-        ("resumes", ("rahul.pdf",   open("rahul.pdf",   "rb"), "application/pdf")),
-        ("resumes", ("anita.docx",  open("anita.docx",  "rb"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
-        ("resumes", ("vikram.png",  open("vikram.png",  "rb"), "image/png")),
+        ("resumes", ("rahul.pdf",  open("rahul.pdf",  "rb"), "application/pdf")),
+        ("resumes", ("anita.docx", open("anita.docx", "rb"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+        ("resumes", ("vikram.png", open("vikram.png", "rb"), "image/png")),
     ]
     r = requests.post(
         "http://localhost:8000/bulk-analyze/",
         files=files,
         data={"job_description": "We need a Python developer..."},
-        headers={"X-Api-Key": "YOUR_KEY"},
+        headers={"X-RapidAPI-Key": "YOUR_KEY"},
     )
     print(r.json())
     ```
@@ -564,8 +583,6 @@ async def bulk_analyze(
     - `ranked_candidates` — full ATS report per candidate, sorted highest → lowest
     - `failed_files` — any files that could not be parsed, with reasons
     """
-    user = get_authenticated_user(x_api_key, db)
-
     # ── Parse raw multipart ────────────────────────────────────────
     try:
         form = await request.form()
@@ -608,7 +625,7 @@ async def bulk_analyze(
     errors:  List[dict] = []
 
     for resume_file in resume_files:
-        fname = resume_file.filename or "unknown"
+        fname          = resume_file.filename or "unknown"
         candidate_name = filename_to_name(fname)
         try:
             raw_bytes = await resume_file.read()
