@@ -117,6 +117,35 @@ except Exception as e:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  HEALTH CHECK  — required for RapidAPI health check to pass
+#  Set Health Check URL to: https://resume-api-c908.onrender.com/health
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/health", tags=["Health"], include_in_schema=False)
+@app.get("/",       tags=["Health"], include_in_schema=False)
+async def health_check():
+    """
+    Health check endpoint.
+    RapidAPI pings this daily — must return HTTP 200.
+    Also handles root URL so there is no 404.
+    """
+    db_status = "ok"
+    try:
+        db = SessionLocal()
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db.close()
+    except Exception as e:
+        db_status = f"error: {e}"
+
+    return {
+        "status":  "ok",
+        "service": "Resume ATS Intelligence API",
+        "version": "3.0.0",
+        "database": db_status,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
 #  GLOBAL ERROR HANDLER  — turns any unhandled crash into clean JSON
 # ══════════════════════════════════════════════════════════════════
 
