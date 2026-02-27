@@ -1,27 +1,12 @@
 """
 main.py  ─  Resume ATS Intelligence API  v3.0.0
-─────────────────────────────────────────────────
-HOW MONTHLY LIMITS WORK:
-─────────────────────────
-  Every request goes through get_rapidapi_user() FIRST.
-  It counts rows in usage_logs WHERE user_id = ? AND month = current_month.
-  If count >= monthly_limit  →  HTTP 429 is raised immediately.
-  If count < monthly_limit   →  request proceeds, then log_usage() adds 1 row.
-
-  Plan limits (auto-synced from X-RapidAPI-Subscription header):
-    BASIC   →   50 requests / month
-    PRO     →  500 requests / month
-    ULTRA   → 2000 requests / month
-    MEGA    → 10000 requests / month
-
-  Set RAPIDAPI_PROXY_SECRET env variable from:
-  RapidAPI Dashboard → My APIs → Your API → Security → Proxy Secret
 """
 
 import io
 import os
-import uuid
+import logging
 import tempfile
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -30,12 +15,24 @@ from fastapi import (
     FastAPI, Depends, HTTPException,
     UploadFile, File, Form, Request
 )
-from sqlalchemy import func, extract
+from fastapi.responses import JSONResponse
+from sqlalchemy import extract
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine
 from models import Base, User, APIKey, UsageLog
 from services.resume_analyzer import analyze_resume
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LOGGING  — errors will now appear in your server logs
+# ══════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -47,6 +44,7 @@ try:
     PYPDF_OK = True
 except ImportError:
     PYPDF_OK = False
+    logger.warning("pypdf not installed — PDF support disabled.")
 
 try:
     from pdf2image import convert_from_bytes
@@ -54,18 +52,21 @@ try:
     OCR_OK = True
 except ImportError:
     OCR_OK = False
+    logger.warning("pdf2image/pytesseract not installed — scanned PDF OCR disabled.")
 
 try:
     import docx
     DOCX_OK = True
 except ImportError:
     DOCX_OK = False
+    logger.warning("python-docx not installed — DOCX support disabled.")
 
 try:
     import textract
     TEXTRACT_OK = True
 except ImportError:
     TEXTRACT_OK = False
+    logger.warning("textract not installed — DOC support disabled.")
 
 try:
     from PIL import Image
@@ -73,6 +74,7 @@ try:
     PIL_OK = True
 except ImportError:
     PIL_OK = False
+    logger.warning("Pillow/pytesseract not installed — image OCR disabled.")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -82,11 +84,11 @@ except ImportError:
 RAPIDAPI_PROXY_SECRET = os.environ.get("RAPIDAPI_PROXY_SECRET", "")
 
 PLAN_LIMITS = {
-    "BASIC":   50,
-    "PRO":     500,
-    "ULTRA":   2000,
-    "MEGA":    10000,
-    "CUSTOM":  99999,
+    "BASIC":  50,
+    "PRO":    500,
+    "ULTRA":  2000,
+    "MEGA":   10000,
+    "CUSTOM": 99999,
 }
 
 PDF_EXTS   = {".pdf"}
@@ -104,29 +106,34 @@ ALL_SUPPORTED = PDF_EXTS | DOCX_EXTS | DOC_EXTS | IMAGE_EXTS | TEXT_EXTS
 app = FastAPI(
     title="Resume ATS Intelligence API",
     version="3.0.0",
-    description="""
-## Resume ATS Intelligence API  v3.0.0
-
-Analyze resumes against job descriptions with a full ATS score report.
-
-### How Monthly Limits Work
-Each API plan comes with a monthly request limit:
-
-| Plan  | Requests / Month |
-|-------|-----------------|
-| Basic  | 50  |
-| Pro    | 500 |
-| Ultra  | 2,000 |
-| Mega   | 10,000 |
-
-Once your limit is reached you will receive a **429 Too Many Requests** error
-until the next calendar month resets your count.
-
-### Supported File Formats
-`PDF` · `DOCX` · `DOC` · `PNG` · `JPG` · `WEBP` · `TXT`
-    """,
 )
-Base.metadata.create_all(bind=engine)
+
+# Create all DB tables on startup
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created/verified OK.")
+except Exception as e:
+    logger.error(f"FATAL: Could not create DB tables: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  GLOBAL ERROR HANDLER  — turns any unhandled crash into clean JSON
+# ══════════════════════════════════════════════════════════════════
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    logger.error(f"Unhandled error on {request.url.path}:\n{tb}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error":   "Internal Server Error",
+            "detail":  str(exc),
+            "type":    type(exc).__name__,
+            # Remove 'trace' in production for security
+            "trace":   tb.splitlines()[-3:],
+        },
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -142,34 +149,35 @@ def get_db():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  USAGE COUNTING  (the heart of the rate limiting)
+#  USAGE TRACKING
 # ══════════════════════════════════════════════════════════════════
 
 def _count_usage_this_month(user_id: int, db: Session) -> int:
-    """
-    Count how many requests this user has made in the current calendar month.
-    Uses the request_time column in usage_logs table.
-    """
     now = datetime.utcnow()
-    return db.query(UsageLog).filter(
-        UsageLog.user_id == user_id,
-        extract("year",  UsageLog.request_time) == now.year,
-        extract("month", UsageLog.request_time) == now.month,
-    ).count()
+    try:
+        return db.query(UsageLog).filter(
+            UsageLog.user_id == user_id,
+            extract("year",  UsageLog.request_time) == now.year,
+            extract("month", UsageLog.request_time) == now.month,
+        ).count()
+    except Exception as e:
+        logger.error(f"Error counting usage for user {user_id}: {e}")
+        return 0
 
 
 def log_usage(user_id: int, endpoint: str, db: Session):
-    """
-    Write one row to usage_logs after a successful request.
-    This is what gets counted next time _count_usage_this_month() runs.
-    """
-    db.add(UsageLog(
-        user_id=user_id,
-        request_time=datetime.utcnow(),
-        endpoint=endpoint,
-        status="success",
-    ))
-    db.commit()
+    try:
+        db.add(UsageLog(
+            user_id=user_id,
+            request_time=datetime.utcnow(),
+            endpoint=endpoint,
+            status="success",
+        ))
+        db.commit()
+        logger.info(f"Usage logged: user_id={user_id} endpoint={endpoint}")
+    except Exception as e:
+        logger.error(f"Failed to log usage for user {user_id}: {e}")
+        db.rollback()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -177,75 +185,113 @@ def log_usage(user_id: int, endpoint: str, db: Session):
 # ══════════════════════════════════════════════════════════════════
 
 def get_rapidapi_user(request: Request, db: Session = Depends(get_db)) -> User:
-    """
-    Runs before EVERY protected endpoint.
+    try:
+        # Step 1: Proxy secret
+        incoming_secret = request.headers.get("x-rapidapi-proxy-secret", "")
+        if RAPIDAPI_PROXY_SECRET and incoming_secret != RAPIDAPI_PROXY_SECRET:
+            logger.warning(f"Invalid proxy secret from {request.client.host}")
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden. This API must be called through RapidAPI.",
+            )
 
-    Steps:
-      1. Verify X-RapidAPI-Proxy-Secret  (proves request came from RapidAPI)
-      2. Read X-RapidAPI-User            (the subscriber's username)
-      3. Read X-RapidAPI-Subscription    (their plan → monthly limit)
-      4. Auto-create user in DB if first time seen
-      5. Count requests this month
-      6. Block with HTTP 429 if limit reached
-    """
+        # Step 2: RapidAPI username
+        rapidapi_user = request.headers.get("x-rapidapi-user", "").strip()
+        if not rapidapi_user:
+            logger.warning("Request missing x-rapidapi-user header")
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized. Subscribe to this API on RapidAPI to get access.",
+            )
 
-    # ── Step 1: Proxy secret check ────────────────────────────────
-    incoming_secret = request.headers.get("x-rapidapi-proxy-secret", "")
-    if RAPIDAPI_PROXY_SECRET and incoming_secret != RAPIDAPI_PROXY_SECRET:
-        raise HTTPException(
-            status_code=403,
-            detail="Forbidden. This API must be called through RapidAPI.",
-        )
+        # Step 3: Plan & limit
+        subscription  = request.headers.get("x-rapidapi-subscription", "BASIC").strip().upper()
+        monthly_limit = PLAN_LIMITS.get(subscription, 50)
+        logger.info(f"Request from user={rapidapi_user} plan={subscription} limit={monthly_limit}")
 
-    # ── Step 2: RapidAPI username ─────────────────────────────────
-    rapidapi_user = request.headers.get("x-rapidapi-user", "").strip()
-    if not rapidapi_user:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized. Subscribe to this API on RapidAPI to get access.",
-        )
-
-    # ── Step 3: Plan & limit ──────────────────────────────────────
-    subscription  = request.headers.get("x-rapidapi-subscription", "BASIC").strip().upper()
-    monthly_limit = PLAN_LIMITS.get(subscription, 50)
-
-    # ── Step 4: Auto-create / sync user ──────────────────────────
-    user = db.query(User).filter(User.email == rapidapi_user).first()
-    if not user:
-        # First time this RapidAPI user hits your API — create their record
-        user = User(
-            email=rapidapi_user,
-            plan=subscription.lower(),
-            monthly_limit=monthly_limit,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    else:
-        # Sync plan changes (e.g. user upgraded from BASIC to PRO)
-        if user.plan != subscription.lower() or user.monthly_limit != monthly_limit:
-            user.plan          = subscription.lower()
-            user.monthly_limit = monthly_limit
+        # Step 4: Auto-create / sync user
+        user = db.query(User).filter(User.email == rapidapi_user).first()
+        if not user:
+            logger.info(f"New user detected, creating record: {rapidapi_user}")
+            user = User(
+                email=rapidapi_user,
+                plan=subscription.lower(),
+                monthly_limit=monthly_limit,
+            )
+            db.add(user)
             db.commit()
+            db.refresh(user)
+        else:
+            if user.plan != subscription.lower() or user.monthly_limit != monthly_limit:
+                logger.info(f"Updating plan for {rapidapi_user}: {user.plan} → {subscription.lower()}")
+                user.plan          = subscription.lower()
+                user.monthly_limit = monthly_limit
+                db.commit()
 
-    # ── Step 5 & 6: Count + enforce ──────────────────────────────
-    used = _count_usage_this_month(user.id, db)
+        # Step 5: Count usage
+        used = _count_usage_this_month(user.id, db)
+        logger.info(f"User {rapidapi_user} used {used}/{monthly_limit} requests this month")
 
-    if used >= user.monthly_limit:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error":         "Monthly request limit reached.",
-                "plan":          user.plan.upper(),
-                "limit":         user.monthly_limit,
-                "used":          used,
-                "remaining":     0,
-                "resets":        f"1st of next month (UTC)",
-                "upgrade":       "Visit RapidAPI to upgrade your plan for more requests.",
-            },
-        )
+        # Step 6: Enforce limit
+        if used >= user.monthly_limit:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error":              "Monthly request limit reached.",
+                    "plan":               user.plan.upper(),
+                    "limit":              user.monthly_limit,
+                    "used":               used,
+                    "remaining":          0,
+                    "resets":             "1st of next month (UTC)",
+                    "upgrade":            "Visit RapidAPI to upgrade your plan.",
+                },
+            )
 
-    return user
+        return user
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_rapidapi_user: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Auth error: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DEBUG ENDPOINT  (remove after debugging is done)
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/debug/", include_in_schema=False)
+async def debug(request: Request):
+    """
+    Call this through RapidAPI to see exactly what headers are arriving.
+    Delete this endpoint once everything is working.
+    """
+    return {
+        "headers_received": dict(request.headers),
+        "rapidapi_user":    request.headers.get("x-rapidapi-user", "NOT FOUND"),
+        "rapidapi_plan":    request.headers.get("x-rapidapi-subscription", "NOT FOUND"),
+        "proxy_secret_set": bool(RAPIDAPI_PROXY_SECRET),
+        "proxy_secret_ok":  request.headers.get("x-rapidapi-proxy-secret", "") == RAPIDAPI_PROXY_SECRET
+                            if RAPIDAPI_PROXY_SECRET else "PROXY_SECRET_NOT_SET_IN_ENV",
+        "db_ok":            _check_db(),
+        "imports": {
+            "pypdf":        PYPDF_OK,
+            "pdf2image":    OCR_OK,
+            "python_docx":  DOCX_OK,
+            "textract":     TEXTRACT_OK,
+            "pillow":       PIL_OK,
+        },
+    }
+
+
+def _check_db() -> str:
+    try:
+        db = SessionLocal()
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db.close()
+        return "OK"
+    except Exception as e:
+        return f"ERROR: {e}"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -254,7 +300,7 @@ def get_rapidapi_user(request: Request, db: Session = Depends(get_db)) -> User:
 
 def _extract_pdf(file_bytes: bytes, filename: str) -> str:
     if not PYPDF_OK:
-        raise HTTPException(status_code=501, detail="pypdf not installed.")
+        raise HTTPException(status_code=501, detail="pypdf not installed. Run: pip install pypdf")
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         text   = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
@@ -265,7 +311,7 @@ def _extract_pdf(file_bytes: bytes, filename: str) -> str:
         return text
 
     if not OCR_OK:
-        raise HTTPException(status_code=422, detail=f"'{filename}' is a scanned PDF. OCR not available.")
+        raise HTTPException(status_code=422, detail=f"'{filename}' is a scanned PDF and OCR is not available.")
     try:
         images = convert_from_bytes(file_bytes, dpi=200)
         text   = "\n".join(pytesseract.image_to_string(img, lang="eng") for img in images).strip()
@@ -281,13 +327,13 @@ def _extract_docx(file_bytes: bytes, filename: str) -> str:
     if not DOCX_OK:
         raise HTTPException(status_code=501, detail="python-docx not installed.")
     try:
-        doc   = docx.Document(io.BytesIO(file_bytes))
-        parts = [p.text for p in doc.paragraphs]
-        for table in doc.tables:
+        document = docx.Document(io.BytesIO(file_bytes))
+        parts    = [p.text for p in document.paragraphs]
+        for table in document.tables:
             for row in table.rows:
                 for cell in row.cells:
                     parts.append(cell.text)
-        for section in doc.sections:
+        for section in document.sections:
             for p in (section.header.paragraphs if section.header else []):
                 parts.append(p.text)
             for p in (section.footer.paragraphs if section.footer else []):
@@ -346,7 +392,6 @@ def filename_to_name(filename: str) -> str:
 
 
 def _collect_files(form) -> List[UploadFile]:
-    """Collect uploaded files regardless of field name used by the client."""
     found, seen = [], set()
     for field in ("resumes", "resume_file", "resume", "file", "files"):
         for item in form.getlist(field):
@@ -378,31 +423,39 @@ async def analyze_resume_endpoint(
     user: User    = Depends(get_rapidapi_user),
     db:   Session = Depends(get_db),
 ):
-    """
-    Upload **one** resume + paste the job description.
-    Returns a full structured ATS report.
+    try:
+        logger.info(f"analyze-resume called by user_id={user.id} file={resume_file.filename}")
 
-    **Counts as 1 request** toward your monthly limit.
-    """
-    # Read & analyze
-    raw_bytes = await resume_file.read()
-    text      = extract_text(raw_bytes, resume_file.filename)
-    name      = candidate_name or filename_to_name(resume_file.filename)
-    result    = analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
+        raw_bytes = await resume_file.read()
+        if not raw_bytes:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
 
-    # Log AFTER success
-    log_usage(user.id, endpoint="/analyze-resume/", db=db)
+        text   = extract_text(raw_bytes, resume_file.filename)
+        name   = candidate_name or filename_to_name(resume_file.filename)
+        result = analyze_resume(
+            resume_text=text,
+            job_description=job_description,
+            candidate_name=name,
+        )
 
-    # Append usage info to response
-    used = _count_usage_this_month(user.id, db)
-    result["usage"] = {
-        "requests_used":      used,
-        "requests_limit":     user.monthly_limit,
-        "requests_remaining": max(0, user.monthly_limit - used),
-        "plan":               user.plan.upper(),
-    }
+        log_usage(user.id, endpoint="/analyze-resume/", db=db)
 
-    return result
+        used = _count_usage_this_month(user.id, db)
+        result["usage"] = {
+            "requests_used":      used,
+            "requests_limit":     user.monthly_limit,
+            "requests_remaining": max(0, user.monthly_limit - used),
+            "plan":               user.plan.upper(),
+        }
+
+        logger.info(f"analyze-resume success for user_id={user.id} score={result.get('ats_score', {}).get('score')}")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"analyze-resume crashed: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
 @app.post(
@@ -435,117 +488,120 @@ async def bulk_analyze(
     user: User    = Depends(get_rapidapi_user),
     db:   Session = Depends(get_db),
 ):
-    """
-    Upload **multiple resumes** against one job description.
-    Returns all candidates ranked by ATS score (highest first).
-
-    **Each file counts as 1 request** toward your monthly limit.
-    Uploading 5 files = 5 requests consumed.
-    """
     try:
-        form = await request.form()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not parse form data: {e}")
+        logger.info(f"bulk-analyze called by user_id={user.id}")
 
-    job_description = form.get("job_description", "").strip()
-    if not job_description:
-        raise HTTPException(status_code=422, detail="Field 'job_description' is required.")
-
-    resume_files = _collect_files(form)
-    if not resume_files:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "No resume files found.",
-                "tip":   "Send files as multipart fields named 'resumes'.",
-                "received_fields": list(form.keys()),
-            },
-        )
-
-    # ── Pre-flight: do they have enough requests left? ────────────
-    used      = _count_usage_this_month(user.id, db)
-    remaining = user.monthly_limit - used
-
-    if len(resume_files) > remaining:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error":         "Not enough requests remaining for this bulk upload.",
-                "files_sent":    len(resume_files),
-                "requests_remaining": remaining,
-                "plan":          user.plan.upper(),
-                "limit":         user.monthly_limit,
-                "tip":           "Upload fewer files or upgrade your plan on RapidAPI.",
-            },
-        )
-
-    # ── Process each file ─────────────────────────────────────────
-    results: List[dict] = []
-    errors:  List[dict] = []
-
-    for resume_file in resume_files:
-        fname = getattr(resume_file, "filename", None) or "unknown"
         try:
-            raw_bytes = await resume_file.read()
-            if not raw_bytes:
-                errors.append({"file": fname, "error": "File is empty."})
-                continue
-            text   = extract_text(raw_bytes, fname)
-            report = analyze_resume(
-                resume_text=text,
-                job_description=job_description,
-                candidate_name=filename_to_name(fname),
-            )
-            results.append(report)
-            log_usage(user.id, endpoint="/bulk-analyze/", db=db)  # 1 log per file
-        except HTTPException as e:
-            errors.append({"file": fname, "error": e.detail})
+            form = await request.form()
         except Exception as e:
-            errors.append({"file": fname, "error": str(e)})
+            raise HTTPException(status_code=400, detail=f"Could not parse form data: {e}")
 
-    if not results and errors:
-        raise HTTPException(
-            status_code=422,
-            detail={"message": "All files failed to process.", "errors": errors},
-        )
+        job_description = form.get("job_description", "").strip()
+        if not job_description:
+            raise HTTPException(status_code=422, detail="Field 'job_description' is required.")
 
-    # ── Rank ──────────────────────────────────────────────────────
-    ranked      = sorted(results, key=lambda r: r["ats_score"]["score"], reverse=True)
-    shortlisted = [r for r in ranked if r["ats_score"]["score"] >= 70]
+        resume_files = _collect_files(form)
+        logger.info(f"bulk-analyze: {len(resume_files)} files received, fields={list(form.keys())}")
 
-    # Final usage count
-    final_used = _count_usage_this_month(user.id, db)
+        if not resume_files:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error":           "No resume files found in the request.",
+                    "tip":             "Send files as multipart fields named 'resumes'.",
+                    "received_fields": list(form.keys()),
+                },
+            )
 
-    return {
-        "summary": {
-            "total_uploaded":        len(resume_files),
-            "successfully_analyzed": len(ranked),
-            "failed":                len(errors),
-            "shortlisted_above_70":  len(shortlisted),
-            "top_candidate":         ranked[0]["candidate"]["name"] if ranked else None,
-            "top_ats_score":         ranked[0]["ats_score"]["score"] if ranked else None,
-        },
-        "usage": {
-            "requests_used":      final_used,
-            "requests_limit":     user.monthly_limit,
-            "requests_remaining": max(0, user.monthly_limit - final_used),
-            "plan":               user.plan.upper(),
-        },
-        "ranked_candidates": [
-            {
-                "rank":                  i + 1,
-                "candidate":             r["candidate"],
-                "ats_score":             r["ats_score"],
-                "skill_analysis":        r["skill_analysis"],
-                "keyword_density":       r["keyword_density"],
-                "section_analysis":      r["section_analysis"],
-                "experience":            r["experience"],
-                "education":             r["education"],
-                "job_title_alignment":   r["job_title_alignment"],
-                "writing_quality":       r["writing_quality"],
-                "format_and_contact":    r["format_and_contact"],
-            }
-            for i, r in enumerate(ranked)
-        ],
-        "failed_files": errors,
-    }
+        # Pre-flight usage check
+        used      = _count_usage_this_month(user.id, db)
+        remaining = user.monthly_limit - used
+        if len(resume_files) > remaining:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error":               "Not enough requests remaining.",
+                    "files_sent":          len(resume_files),
+                    "requests_remaining":  remaining,
+                    "plan":                user.plan.upper(),
+                    "tip":                 "Upload fewer files or upgrade your plan on RapidAPI.",
+                },
+            )
+
+        results: List[dict] = []
+        errors:  List[dict] = []
+
+        for resume_file in resume_files:
+            fname = getattr(resume_file, "filename", None) or "unknown"
+            try:
+                raw_bytes = await resume_file.read()
+                if not raw_bytes:
+                    errors.append({"file": fname, "error": "File is empty."})
+                    continue
+
+                text   = extract_text(raw_bytes, fname)
+                report = analyze_resume(
+                    resume_text=text,
+                    job_description=job_description,
+                    candidate_name=filename_to_name(fname),
+                )
+                results.append(report)
+                log_usage(user.id, endpoint="/bulk-analyze/", db=db)
+                logger.info(f"bulk-analyze: processed {fname} score={report.get('ats_score', {}).get('score')}")
+
+            except HTTPException as e:
+                logger.warning(f"bulk-analyze: skipping {fname} — {e.detail}")
+                errors.append({"file": fname, "error": e.detail})
+            except Exception as e:
+                logger.error(f"bulk-analyze: error on {fname}: {traceback.format_exc()}")
+                errors.append({"file": fname, "error": str(e)})
+
+        if not results and errors:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "All files failed to process.", "errors": errors},
+            )
+
+        ranked      = sorted(results, key=lambda r: r["ats_score"]["score"], reverse=True)
+        shortlisted = [r for r in ranked if r["ats_score"]["score"] >= 70]
+        final_used  = _count_usage_this_month(user.id, db)
+
+        return {
+            "summary": {
+                "total_uploaded":        len(resume_files),
+                "successfully_analyzed": len(ranked),
+                "failed":                len(errors),
+                "shortlisted_above_70":  len(shortlisted),
+                "top_candidate":         ranked[0]["candidate"]["name"] if ranked else None,
+                "top_ats_score":         ranked[0]["ats_score"]["score"] if ranked else None,
+            },
+            "usage": {
+                "requests_used":      final_used,
+                "requests_limit":     user.monthly_limit,
+                "requests_remaining": max(0, user.monthly_limit - final_used),
+                "plan":               user.plan.upper(),
+            },
+            "ranked_candidates": [
+                {
+                    "rank":                i + 1,
+                    "candidate":           r["candidate"],
+                    "ats_score":           r["ats_score"],
+                    "skill_analysis":      r["skill_analysis"],
+                    "keyword_density":     r["keyword_density"],
+                    "section_analysis":    r["section_analysis"],
+                    "experience":          r["experience"],
+                    "education":           r["education"],
+                    "job_title_alignment": r["job_title_alignment"],
+                    "writing_quality":     r["writing_quality"],
+                    "format_and_contact":  r["format_and_contact"],
+                }
+                for i, r in enumerate(ranked)
+            ],
+            "failed_files": errors,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"bulk-analyze crashed: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Bulk analysis failed: {str(e)}")
