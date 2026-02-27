@@ -1,11 +1,29 @@
 """
 main.py  ─  Resume ATS Intelligence API  v3.0.0
 ─────────────────────────────────────────────────
+HOW RAPIDAPI AUTHENTICATION WORKS (when selling on marketplace):
+─────────────────────────────────────────────────────────────────
+  RapidAPI does NOT forward the user's X-RapidAPI-Key to your server.
+  Instead, RapidAPI acts as a proxy and sends these headers to YOUR server:
+
+    X-RapidAPI-Proxy-Secret  → a secret YOU set in RapidAPI dashboard
+                               (proves the request came from RapidAPI)
+    X-RapidAPI-User          → the subscribing user's RapidAPI username
+    X-RapidAPI-Subscription  → their subscription plan name
+
+  So your server should:
+    1. Verify  X-RapidAPI-Proxy-Secret  matches your env variable
+    2. Use     X-RapidAPI-User          as the user identifier
+    3. Track usage per user in your DB
+
+  Set this in your environment:
+    RAPIDAPI_PROXY_SECRET=<copy from RapidAPI dashboard → My APIs → Security>
+
 Accepts resumes as any of:
   • PDF   (text-based or scanned image PDF)
-  • DOCX / DOC  (Word documents, any number of pages)
-  • PNG / JPG / JPEG / WEBP / GIF  (resume screenshots)
-  • TXT   (plain text)
+  • DOCX / DOC
+  • PNG / JPG / JPEG / WEBP / GIF
+  • TXT
 """
 
 import io
@@ -20,7 +38,6 @@ from fastapi import (
     FastAPI, Depends, HTTPException,
     UploadFile, File, Form, Request
 )
-from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -30,7 +47,16 @@ from services.resume_analyzer import analyze_resume
 
 
 # ══════════════════════════════════════════════════════════════════
-#  OPTIONAL DEPENDENCY IMPORTS  (graceful degradation)
+#  RAPIDAPI PROXY SECRET
+#  Copy this value from:
+#  RapidAPI Dashboard → My APIs → Your API → Security → Proxy Secret
+# ══════════════════════════════════════════════════════════════════
+
+RAPIDAPI_PROXY_SECRET = os.environ.get("RAPIDAPI_PROXY_SECRET", "")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  OPTIONAL DEPENDENCY IMPORTS
 # ══════════════════════════════════════════════════════════════════
 
 try:
@@ -75,7 +101,6 @@ DOCX_EXTS  = {".docx"}
 DOC_EXTS   = {".doc"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
 TEXT_EXTS  = {".txt"}
-
 ALL_SUPPORTED = PDF_EXTS | DOCX_EXTS | DOC_EXTS | IMAGE_EXTS | TEXT_EXTS
 
 
@@ -91,24 +116,24 @@ app = FastAPI(
 Analyze resumes against job descriptions with a full ATS score.
 
 ### Authentication
-Pass your API key as the **`X-RapidAPI-Key`** request header.
+This API is sold via **RapidAPI**. Subscribe on RapidAPI and send
+your `X-RapidAPI-Key` header — RapidAPI handles authentication for you.
 
 ### Supported File Formats
 | Format | Notes |
 |--------|-------|
-| **PDF** | Text-based PDFs parsed directly; scanned/image PDFs auto-OCR'd |
-| **DOCX** | Word 2007+ documents, any number of pages |
-| **DOC** | Legacy Word format via textract/LibreOffice |
-| **PNG / JPG / JPEG / WEBP / GIF** | Resume screenshots via OCR |
+| **PDF** | Text-based PDFs parsed directly; scanned PDFs auto-OCR'd |
+| **DOCX** | Word 2007+ documents |
+| **DOC** | Legacy Word format |
+| **PNG / JPG / WEBP / GIF** | Resume screenshots via OCR |
 | **TXT** | Plain text |
 
 ### Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/create-user/` | Register and get an API key |
 | POST | `/analyze-resume/` | Single file → ATS report |
 | POST | `/bulk-analyze/` | Multiple files → ranked list |
-| GET  | `/usage/` | Check monthly usage |
+| GET  | `/usage/` | Check your monthly usage |
     """,
     version="3.0.0",
 )
@@ -128,43 +153,20 @@ def get_db():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  AUTH HELPER
+#  RAPIDAPI AUTH
 #
-#  WHY we read from Request directly instead of Header() / Security():
-#  ─────────────────────────────────────────────────────────────────
-#  FastAPI's Header() and APIKeyHeader() both validate the header
-#  at the parameter-binding stage and raise 422/401 before our code
-#  even runs — but RapidAPI's proxy sometimes lowercases headers or
-#  sends the key under a slightly different casing, causing false
-#  failures.
+#  When a user calls your API through RapidAPI, RapidAPI's proxy
+#  forwards the request to your server with these headers:
 #
-#  Reading from request.headers (a case-insensitive dict in Starlette)
-#  lets us check every variant in one place without triggering
-#  FastAPI's early-exit validation.
+#    X-RapidAPI-Proxy-Secret  →  your secret (verify this!)
+#    X-RapidAPI-User          →  the caller's RapidAPI username
+#    X-RapidAPI-Subscription  →  their plan (BASIC, PRO, etc.)
 #
-#  Headers checked (in priority order):
-#    1. x-rapidapi-key   ← RapidAPI standard proxy header
-#    2. x-api-key        ← direct callers / local testing
+#  Your job:
+#    1. Check the proxy secret matches what's in your dashboard
+#    2. Auto-create a local user record for new RapidAPI users
+#    3. Track & enforce usage limits per user
 # ══════════════════════════════════════════════════════════════════
-
-_KEY_HEADERS = ["x-rapidapi-key", "x-api-key"]
-
-
-def _get_raw_api_key(request: Request) -> str:
-    """Extract API key from headers. Starlette headers are case-insensitive."""
-    for h in _KEY_HEADERS:
-        val = request.headers.get(h)
-        if val:
-            return val.strip()
-    raise HTTPException(
-        status_code=401,
-        detail=(
-            "API key missing. "
-            "Send your key in the 'X-RapidAPI-Key' header. "
-            "Register at /create-user/ to get a key."
-        ),
-    )
-
 
 def _usage_this_month(user_id: int, db: Session) -> int:
     return db.query(UsageLog).filter(
@@ -173,26 +175,84 @@ def _usage_this_month(user_id: int, db: Session) -> int:
     ).count()
 
 
-def get_authenticated_user(request: Request, db: Session = Depends(get_db)) -> User:
+def get_rapidapi_user(request: Request, db: Session = Depends(get_db)) -> User:
     """
-    Dependency used by all protected endpoints.
-    Extracts key → validates → enforces monthly limit → returns User.
+    Auth dependency for all endpoints.
+
+    Verifies the RapidAPI proxy secret, then looks up (or auto-creates)
+    a local user based on the RapidAPI username header.
     """
-    api_key = _get_raw_api_key(request)
+    # ── Step 1: Verify this request actually came from RapidAPI ───
+    proxy_secret = request.headers.get("x-rapidapi-proxy-secret", "")
 
-    key_row = db.query(APIKey).filter(APIKey.api_key == api_key).first()
-    if not key_row:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-
-    user = db.query(User).filter(User.id == key_row.user_id).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found for this API key.")
-
-    if _usage_this_month(user.id, db) >= user.monthly_limit:
+    if not RAPIDAPI_PROXY_SECRET:
+        # If env var not set, warn in logs but don't block (dev mode)
+        import warnings
+        warnings.warn(
+            "RAPIDAPI_PROXY_SECRET env variable is not set! "
+            "Set it to the value from your RapidAPI dashboard to secure your API.",
+            stacklevel=2,
+        )
+    elif proxy_secret != RAPIDAPI_PROXY_SECRET:
         raise HTTPException(
             status_code=403,
-            detail=f"Monthly limit of {user.monthly_limit} requests reached. Upgrade your plan.",
+            detail="Forbidden. This API must be called through RapidAPI.",
         )
+
+    # ── Step 2: Get the caller's RapidAPI username ─────────────────
+    rapidapi_user = request.headers.get("x-rapidapi-user", "").strip()
+    if not rapidapi_user:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Could not identify caller. "
+                "Please call this API through RapidAPI with a valid subscription."
+            ),
+        )
+
+    # ── Step 3: Get subscription/plan ─────────────────────────────
+    subscription = request.headers.get("x-rapidapi-subscription", "BASIC").strip().upper()
+
+    # Map RapidAPI plan names to monthly limits
+    plan_limits = {
+        "BASIC":      50,
+        "PRO":        500,
+        "ULTRA":      2000,
+        "MEGA":       10000,
+        "CUSTOM":     99999,
+    }
+    monthly_limit = plan_limits.get(subscription, 50)
+
+    # ── Step 4: Auto-create user if first time seen ────────────────
+    # Use rapidapi_user as the email/identifier (stored as email in DB)
+    user = db.query(User).filter(User.email == rapidapi_user).first()
+    if not user:
+        user = User(
+            email=rapidapi_user,
+            plan=subscription.lower(),
+            monthly_limit=monthly_limit,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        # Update plan/limit in case they upgraded
+        if user.plan != subscription.lower() or user.monthly_limit != monthly_limit:
+            user.plan          = subscription.lower()
+            user.monthly_limit = monthly_limit
+            db.commit()
+
+    # ── Step 5: Enforce monthly limit ─────────────────────────────
+    used = _usage_this_month(user.id, db)
+    if used >= user.monthly_limit:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Monthly limit of {user.monthly_limit} requests reached. "
+                "Please upgrade your plan on RapidAPI."
+            ),
+        )
+
     return user
 
 
@@ -208,7 +268,6 @@ def log_usage(user_id: int, db: Session):
 def _extract_pdf(file_bytes: bytes, filename: str) -> str:
     if not PYPDF_OK:
         raise HTTPException(status_code=501, detail="pypdf not installed. Run: pip install pypdf")
-
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         pages  = [page.extract_text() or "" for page in reader.pages]
@@ -219,14 +278,10 @@ def _extract_pdf(file_bytes: bytes, filename: str) -> str:
     if text:
         return text
 
-    # Scanned PDF — try OCR
     if not OCR_OK:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"'{filename}' appears to be a scanned/image PDF with no text layer. "
-                "Install pdf2image and pytesseract to enable OCR."
-            ),
+            detail=f"'{filename}' is a scanned PDF. Install pdf2image + pytesseract for OCR.",
         )
     try:
         images    = convert_from_bytes(file_bytes, dpi=200)
@@ -236,10 +291,7 @@ def _extract_pdf(file_bytes: bytes, filename: str) -> str:
         raise HTTPException(status_code=422, detail=f"OCR failed on '{filename}': {exc}")
 
     if not text:
-        raise HTTPException(
-            status_code=422,
-            detail=f"No text could be extracted from '{filename}' even after OCR.",
-        )
+        raise HTTPException(status_code=422, detail=f"No text could be extracted from '{filename}' even after OCR.")
     return text
 
 
@@ -256,25 +308,21 @@ def _extract_docx(file_bytes: bytes, filename: str) -> str:
                 for cell in row.cells:
                     parts.append(cell.text)
         for section in document.sections:
-            for hdr_para in (section.header.paragraphs if section.header else []):
-                parts.append(hdr_para.text)
-            for ftr_para in (section.footer.paragraphs if section.footer else []):
-                parts.append(ftr_para.text)
+            for p in (section.header.paragraphs if section.header else []):
+                parts.append(p.text)
+            for p in (section.footer.paragraphs if section.footer else []):
+                parts.append(p.text)
         text = "\n".join(p for p in parts if p.strip()).strip()
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not read DOCX '{filename}': {exc}")
-
     if not text:
-        raise HTTPException(status_code=422, detail=f"No text extracted from '{filename}'. The document may be empty.")
+        raise HTTPException(status_code=422, detail=f"No text extracted from '{filename}'.")
     return text
 
 
 def _extract_doc(file_bytes: bytes, filename: str) -> str:
     if not TEXTRACT_OK:
-        raise HTTPException(
-            status_code=501,
-            detail="textract not installed. Run: pip install textract (also requires LibreOffice).",
-        )
+        raise HTTPException(status_code=501, detail="textract not installed. Run: pip install textract")
     try:
         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
             tmp.write(file_bytes)
@@ -283,7 +331,6 @@ def _extract_doc(file_bytes: bytes, filename: str) -> str:
         os.unlink(tmp_path)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not extract text from .doc '{filename}': {exc}")
-
     if not text:
         raise HTTPException(status_code=422, detail=f"No text extracted from '{filename}'.")
     return text
@@ -291,38 +338,24 @@ def _extract_doc(file_bytes: bytes, filename: str) -> str:
 
 def _extract_image(file_bytes: bytes, filename: str) -> str:
     if not PIL_OK:
-        raise HTTPException(
-            status_code=501,
-            detail="Pillow / pytesseract not installed. Run: pip install pillow pytesseract",
-        )
+        raise HTTPException(status_code=501, detail="Pillow/pytesseract not installed.")
     try:
         image = Image.open(io.BytesIO(file_bytes))
         text  = pytesseract.image_to_string(image, lang="eng").strip()
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"OCR failed on image '{filename}': {exc}")
-
+        raise HTTPException(status_code=422, detail=f"OCR failed on '{filename}': {exc}")
     if not text:
-        raise HTTPException(
-            status_code=422,
-            detail=f"No text found in image '{filename}'. Ensure the image is clear and legible.",
-        )
+        raise HTTPException(status_code=422, detail=f"No text found in '{filename}'.")
     return text
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
     ext = Path(filename).suffix.lower()
-
-    if ext in TEXT_EXTS:
-        return file_bytes.decode("utf-8", errors="replace").strip()
-    if ext in PDF_EXTS:
-        return _extract_pdf(file_bytes, filename)
-    if ext in DOCX_EXTS:
-        return _extract_docx(file_bytes, filename)
-    if ext in DOC_EXTS:
-        return _extract_doc(file_bytes, filename)
-    if ext in IMAGE_EXTS:
-        return _extract_image(file_bytes, filename)
-
+    if ext in TEXT_EXTS:   return file_bytes.decode("utf-8", errors="replace").strip()
+    if ext in PDF_EXTS:    return _extract_pdf(file_bytes, filename)
+    if ext in DOCX_EXTS:   return _extract_docx(file_bytes, filename)
+    if ext in DOC_EXTS:    return _extract_doc(file_bytes, filename)
+    if ext in IMAGE_EXTS:  return _extract_image(file_bytes, filename)
     raise HTTPException(
         status_code=415,
         detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(ALL_SUPPORTED))}",
@@ -335,51 +368,18 @@ def filename_to_name(filename: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PUBLIC ENDPOINT — no auth required
+#  ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
 
-@app.post("/create-user/", tags=["Auth"], summary="Register → get API key")
-def create_user(email: str, db: Session = Depends(get_db)):
-    """
-    Register with your email.
-    Returns an API key (basic plan = 50 requests / month).
-    No authentication required.
-    """
-    if db.query(User).filter(User.email == email).first():
-        raise HTTPException(status_code=400, detail="Account already exists for this email.")
-
-    user = User(email=email, plan="basic", monthly_limit=50)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    api_key = str(uuid.uuid4())
-    db.add(APIKey(user_id=user.id, api_key=api_key))
-    db.commit()
-
-    return {
-        "message":       "Account created.",
-        "email":         email,
-        "plan":          "basic",
-        "monthly_limit": 50,
-        "api_key":       api_key,
-        "tip":           "Send your api_key in the X-RapidAPI-Key header on every analysis request.",
-    }
-
-
-# ══════════════════════════════════════════════════════════════════
-#  PROTECTED ENDPOINTS — require X-RapidAPI-Key header
-# ══════════════════════════════════════════════════════════════════
-
-@app.get("/usage/", tags=["Auth"], summary="Check monthly usage")
+@app.get("/usage/", tags=["Account"], summary="Check your monthly usage")
 def get_usage(
-    user: User    = Depends(get_authenticated_user),
+    user: User    = Depends(get_rapidapi_user),
     db:   Session = Depends(get_db),
 ):
-    """Check how many requests you have used and how many remain this month."""
+    """Returns how many requests you have used and how many remain this month."""
     used = _usage_this_month(user.id, db)
     return {
-        "email":           user.email,
+        "rapidapi_user":   user.email,
         "plan":            user.plan,
         "monthly_limit":   user.monthly_limit,
         "used_this_month": used,
@@ -389,25 +389,25 @@ def get_usage(
 
 @app.post(
     "/analyze-resume/",
-    tags=["Job Seeker"],
-    summary="Upload one resume (PDF/DOCX/DOC/Image/TXT) → full ATS report",
+    tags=["Resume Analysis"],
+    summary="Upload one resume → full ATS report",
 )
 async def analyze_resume_endpoint(
     request:         Request,
-    job_description: str          = Form(..., description="Paste the full job description text."),
-    resume_file:     UploadFile   = File(..., description="Resume file: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
-    candidate_name:  Optional[str]= Form(None, description="Optional. Defaults to filename."),
-    user: User    = Depends(get_authenticated_user),
+    job_description: str           = Form(..., description="Paste the full job description text."),
+    resume_file:     UploadFile    = File(..., description="Resume: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
+    candidate_name:  Optional[str] = Form(None, description="Optional candidate name. Defaults to filename."),
+    user: User    = Depends(get_rapidapi_user),
     db:   Session = Depends(get_db),
 ):
     """
-    Upload **one** resume file + paste the job description.
+    Upload **one** resume + paste the job description → get a full ATS score report.
 
     ### Supported formats
     `PDF` · `DOCX` · `DOC` · `PNG` · `JPG` · `JPEG` · `WEBP` · `TXT`
 
-    ### Scanned / image PDFs
-    Automatically OCR'd with Tesseract if no text layer is found.
+    ### Scanned PDFs
+    Automatically OCR'd if no text layer is found.
     """
     log_usage(user.id, db)
     raw_bytes = await resume_file.read()
@@ -417,30 +417,9 @@ async def analyze_resume_endpoint(
 
 
 @app.post(
-    "/analyze-resume-pdf/",
-    tags=["Job Seeker"],
-    summary="[Deprecated] Use /analyze-resume/ instead",
-    include_in_schema=False,
-)
-async def analyze_resume_pdf_compat(
-    request:         Request,
-    job_description: str          = Form(...),
-    resume_pdf:      UploadFile   = File(...),
-    candidate_name:  Optional[str]= Form(None),
-    user: User    = Depends(get_authenticated_user),
-    db:   Session = Depends(get_db),
-):
-    log_usage(user.id, db)
-    raw_bytes = await resume_pdf.read()
-    text      = extract_text(raw_bytes, resume_pdf.filename)
-    name      = candidate_name or filename_to_name(resume_pdf.filename)
-    return analyze_resume(resume_text=text, job_description=job_description, candidate_name=name)
-
-
-@app.post(
     "/bulk-analyze/",
-    tags=["Hiring Team"],
-    summary="Upload multiple resumes (any format) → ranked ATS candidate list",
+    tags=["Resume Analysis"],
+    summary="Upload multiple resumes → ranked ATS candidate list",
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -457,7 +436,7 @@ async def analyze_resume_pdf_compat(
                             "resumes": {
                                 "type":        "array",
                                 "items":       {"type": "string", "format": "binary"},
-                                "description": "Upload multiple resume files. Any mix of PDF/DOCX/DOC/PNG/JPG/TXT.",
+                                "description": "Multiple resume files — any mix of PDF/DOCX/DOC/PNG/JPG/TXT.",
                             },
                         },
                     }
@@ -468,49 +447,36 @@ async def analyze_resume_pdf_compat(
 )
 async def bulk_analyze(
     request: Request,
-    user: User    = Depends(get_authenticated_user),
+    user: User    = Depends(get_rapidapi_user),
     db:   Session = Depends(get_db),
 ):
     """
-    ## Bulk Resume Ranking — Hiring Team Mode
-
-    Upload **multiple resumes** (any mix of PDF, DOCX, DOC, PNG, JPG, TXT)
-    against one job description. Candidates are ranked by ATS score.
-
-    ### cURL example
-    ```bash
-    curl -X POST http://localhost:8000/bulk-analyze/ \\
-      -H "X-RapidAPI-Key: YOUR_KEY" \\
-      -F "job_description=We need a Python developer..." \\
-      -F "resumes=@rahul.pdf" \\
-      -F "resumes=@anita.docx"
-    ```
+    Upload **multiple resumes** against one job description.
+    Returns candidates ranked by ATS score.
 
     ### Python example
     ```python
     import requests
     files = [
-        ("resumes", ("rahul.pdf",  open("rahul.pdf",  "rb"), "application/pdf")),
-        ("resumes", ("anita.docx", open("anita.docx", "rb"),
-                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+        ("resumes", ("alice.pdf",  open("alice.pdf",  "rb"), "application/pdf")),
+        ("resumes", ("bob.docx",   open("bob.docx",   "rb"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
     ]
     r = requests.post(
-        "http://localhost:8000/bulk-analyze/",
+        "https://YOUR-API.p.rapidapi.com/bulk-analyze/",
         files=files,
         data={"job_description": "We need a Python developer..."},
-        headers={"X-RapidAPI-Key": "YOUR_KEY"},
+        headers={
+            "X-RapidAPI-Key":  "YOUR_RAPIDAPI_KEY",
+            "X-RapidAPI-Host": "YOUR-API.p.rapidapi.com",
+        },
     )
     print(r.json())
     ```
     """
-    # Parse raw multipart (auth already done via Depends above)
     try:
         form = await request.form()
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not parse form data. Ensure Content-Type is multipart/form-data.",
-        )
+        raise HTTPException(status_code=400, detail="Could not parse multipart form data.")
 
     job_description: str = form.get("job_description", "").strip()
     if not job_description:
@@ -521,11 +487,7 @@ async def bulk_analyze(
     if not resume_files:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "No resume files received. "
-                "Send files as multipart fields all named 'resumes'. "
-                "Supported: PDF, DOCX, DOC, PNG, JPG, WEBP, TXT."
-            ),
+            detail="No resume files received. Send files as multipart fields named 'resumes'.",
         )
 
     # Usage pre-flight
@@ -533,27 +495,22 @@ async def bulk_analyze(
     remaining = user.monthly_limit - used
     if len(resume_files) > remaining:
         raise HTTPException(
-            status_code=403,
-            detail=(
-                f"Upload has {len(resume_files)} files but you only have "
-                f"{remaining} requests remaining this month."
-            ),
+            status_code=429,
+            detail=f"You have {remaining} requests left this month but uploaded {len(resume_files)} files.",
         )
 
-    # Process each file
     results: List[dict] = []
     errors:  List[dict] = []
 
     for resume_file in resume_files:
-        fname          = resume_file.filename or "unknown"
-        candidate_name = filename_to_name(fname)
+        fname = resume_file.filename or "unknown"
         try:
             raw_bytes = await resume_file.read()
             text      = extract_text(raw_bytes, fname)
             report    = analyze_resume(
                 resume_text=text,
                 job_description=job_description,
-                candidate_name=candidate_name,
+                candidate_name=filename_to_name(fname),
             )
             results.append(report)
             log_usage(user.id, db)
