@@ -404,7 +404,7 @@ def create_user(email: str, db: Session = Depends(get_db)):
 
 
 @app.get("/usage/", tags=["Auth"], summary="Check monthly usage")
-def get_usage(x_api_key: str = Header(...), db: Session = Depends(get_db)):
+def get_usage(x_api_key: str = Header(..., alias="X-RapidAPI-Key"), db: Session = Depends(get_db)):
     key = db.query(APIKey).filter(APIKey.api_key == x_api_key).first()
     if not key:
         raise HTTPException(status_code=401, detail="Invalid API key.")
@@ -432,7 +432,7 @@ async def analyze_resume_endpoint(
     job_description: str = Form(..., description="Paste the full job description text."),
     resume_file:     UploadFile = File(..., description="Resume file: PDF, DOCX, DOC, PNG, JPG, WEBP, or TXT."),
     candidate_name:  Optional[str] = Form(None, description="Optional. Defaults to filename."),
-    x_api_key:       str = Header(..., description="API key from /create-user/"),
+    x_api_key: str = Header(..., alias="X-RapidAPI-Key", description="API key from /create-user/"),
     db:              Session = Depends(get_db),
 ):
     """
@@ -469,7 +469,7 @@ async def analyze_resume_pdf_compat(
     job_description: str = Form(...),
     resume_pdf:      UploadFile = File(...),
     candidate_name:  Optional[str] = Form(None),
-    x_api_key:       str = Header(...),
+    x_api_key: str = Header(..., alias="X-RapidAPI-Key"),
     db:              Session = Depends(get_db),
 ):
     user      = get_authenticated_user(x_api_key, db)
@@ -515,7 +515,7 @@ async def analyze_resume_pdf_compat(
 )
 async def bulk_analyze(
     request:   Request,
-    x_api_key: str = Header(..., description="API key from /create-user/"),
+    x_api_key: str = Header(..., alias="X-RapidAPI-Key",description="API key from /create-user/"),
     db:        Session = Depends(get_db),
 ):
     """
