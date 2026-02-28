@@ -466,24 +466,9 @@ def analyze_resume(
                 "description": "Ensemble NLP similarity: skills + keywords + BM25 + Jaccard",
                 "detail":      jd_match_detail,
             },
-            "overall_compatibility": {
-                "value":       overall,
-                "out_of":      100,
-                "description": "58% ATS score + 42% JD match (weighted ensemble)",
-            },
+           
         },
 
-        # ── Score Breakdown ───────────────────────────────────────
-        "score_breakdown": {
-            "components_display": score_display,
-            "raw_values":         score_raw,
-            "nlp_signals": {
-                "bm25_raw":           round(bm25_score, 2),
-                "tfidf_cosine":       round(jd_match_detail.get("tfidf_cosine", 0), 2),
-                "jaccard":            round(jd_match_detail.get("jaccard_similarity", 0), 2),
-                "overlap_coeff":      round(jd_match_detail.get("overlap_coefficient", 0), 2),
-            },
-        },
 
         # ── Skill Analysis ────────────────────────────────────────
         "skill_analysis": {
@@ -590,27 +575,6 @@ def analyze_resume(
         # ── AI Insights ───────────────────────────────────────────
         "ai_insights": insights,
 
-        # ── NLP Methods Used ──────────────────────────────────────
-        "analysis_metadata": {
-            "version":          "5.0.0",
-            "nlp_methods": [
-                "BM25 Okapi ranking",
-                "TF-IDF cosine similarity",
-                "Jaccard similarity (with bigrams)",
-                "Overlap coefficient",
-                "Weighted skill matching with context boost",
-                "Negation detection",
-                "Positional TF-IDF keyword extraction",
-                "N-gram extraction (uni/bi/trigrams)",
-                "Rule-based lemmatization",
-                "Synonym normalization",
-                "Section-boundary parsing",
-                "Experience timeline parsing",
-                "Writing quality analysis",
-            ],
-            "skill_db_size":   "200+ skills with aliases",
-            "scoring_model":   "Ensemble weighted scoring with title multiplier",
-        },
     }
 
 
