@@ -15,6 +15,7 @@ Parses resume into structured sections using NLP techniques:
 """
 
 import re
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
 
@@ -45,10 +46,12 @@ SECTION_PATTERNS: Dict[str, List[str]] = {
     "projects":       ["projects", "project work", "personal projects",
                        "academic projects", "key projects", "notable projects",
                        "open source", "portfolio", "side projects",
-                       "major projects", "selected projects"],
+                       "major projects", "selected projects", "personal ventures",
+                       "github highlights", "side hustles", "open source contributions"],
     "certifications": ["certifications", "certification", "certificates",
                        "professional certifications", "licenses", "credentials",
-                       "courses", "online courses", "training", "accreditations"],
+                       "courses", "online courses", "training", "accreditations",
+                       "professional licenses", "credentials & badges"],
     "achievements":   ["achievements", "awards", "honors", "recognitions",
                        "accomplishments", "publications", "patents",
                        "scholarships", "distinctions", "honors & awards",
@@ -235,26 +238,28 @@ def split_into_sections(resume_text: str) -> Dict[str, str]:
 def extract_contact_info(text: str) -> Dict:
     """Extract all contact information from resume text."""
     email_match    = re.search(r'[\w\.\-\+]+@[\w\.-]+\.\w{2,6}', text)
-    phone_match    = re.search(r'(?:\+?\d[\d\s\-\(\)\.]{8,16}\d)', text)
+    phone_match    = re.search(r'(?:\+?\d{1,3}[\s\-\.]?)?\(?\d{2,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{4,6}', text)
     linkedin_match = re.search(r'(?:linkedin\.com/in/|linkedin\.com/pub/)([a-zA-Z0-9\-\_]+)', text, re.IGNORECASE)
     github_match   = re.search(r'(?:github\.com/)([a-zA-Z0-9\-\_]+)', text, re.IGNORECASE)
     portfolio_match = re.search(
-        r'(?:portfolio|website|site|blog|personal)[\s:]+([https?://]?[a-zA-Z0-9\.\-\/]+\.[a-zA-Z]{2,})',
+        r'(?:portfolio|website|site|blog|personal|be\.net|dribbble\.com|behance\.net)[\s:]+([https?://]?[a-zA-Z0-9\.\-\/]+\.[a-zA-Z]{2,})',
         text, re.IGNORECASE
     )
     # Generic URL (catch portfolio/website)
     url_match = re.search(
-        r'https?://(?!linkedin|github)[a-zA-Z0-9\.\-\/]+\.[a-zA-Z]{2,}[/\w\-\.]*',
+        r'https?://(?!linkedin|github|google|facebook|twitter|instagram|x\.com)[a-zA-Z0-9\.\-\/]+\.[a-zA-Z]{2,}[/\w\-\.]*',
         text, re.IGNORECASE
     )
 
     # Name heuristic: first non-empty line that looks like a name
     name = None
+    blacklist = {'resume', 'cv', 'curriculum', 'vitae', 'contact', 'summary', 'profile', 'experience'}
     for line in text.split('\n')[:8]:
         line = line.strip()
-        if (2 <= len(line.split()) <= 5
-                and re.match(r'^[A-Z][a-z]', line)
-                and not any(c in line for c in ['@', ':', '/', 'http'])):
+        if (2 <= len(line.split()) <= 4
+                and re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$', line)
+                and not any(c in line for c in ['@', ':', '/', 'http'])
+                and not any(w in line.lower() for w in blacklist)):
             name = line
             break
 
@@ -293,8 +298,8 @@ _YEAR_ONLY_RE = re.compile(rf'\b({_YEAR})\b')
 
 def _parse_year(s: str) -> Optional[int]:
     s = s.strip().lower()
-    if any(w in s for w in ['present', 'current', 'now', 'date']):
-        return 2025  # approximate current year
+    if any(w in s for w in ['present', 'current', 'now', 'till date', 'to date']):
+        return datetime.now().year
     m = re.search(r'(20\d{2}|19\d{2})', s)
     return int(m.group(1)) if m else None
 
@@ -333,7 +338,8 @@ def extract_experience_years(text: str) -> Tuple[Optional[float], List[Dict]]:
         return round(total_months / 12, 1), jobs
 
     # Strategy 3: Year span heuristic
-    years = [int(y) for y in re.findall(r'\b(20[0-2]\d|19[89]\d)\b', text)]
+    current_year = datetime.now().year
+    years = [int(y) for y in re.findall(rf'\b(20[0-{current_year//10 % 10}]\d|19[89]\d)\b', text)]
     if len(years) >= 2:
         span = max(years) - min(years)
         return float(min(span, 35)), []
@@ -386,14 +392,19 @@ def extract_education_level(text: str) -> int:
 def extract_gpa(text: str) -> Optional[str]:
     """Extract GPA/CGPA from resume."""
     patterns = [
-        r'(?:cgpa|gpa|grade)[:\s]+(\d+\.\d+)\s*(?:/\s*(?:\d+\.?\d*|10))?',
-        r'(\d+\.\d+)\s*/\s*(?:10\.0|10|4\.0|4)\s*(?:cgpa|gpa)?',
-        r'(?:cgpa|gpa)\s*of\s*(\d+\.\d+)',
+        r'(?:cgpa|gpa|grade|score|pointer)[:\s]+(\d+(?:\.\d+)?)\s*(?:/\s*(\d+\.?\d*|10|4|100|5))?',
+        r'(\d+(?:\.\d+)?)\s*(?:/|out of)\s*(\d+\.?\d*|10\.0|10|4\.0|4|100|5)\s*(?:cgpa|gpa)?',
+        r'(?:cgpa|gpa|score)\s*of\s*(\d+(?:\.\d+)?)',
+        r'Grade\s*[:\-]\s*([A-Fa-f][\+\-]?|[\d\.]+\s*(?:%|percent)?)',
     ]
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            return m.group(1)
+            val = m.group(1).strip()
+            total = m.group(2).strip() if len(m.groups()) >= 2 and m.group(2) else "10"
+            if "/" not in val and total:
+                return f"{val}/{total}"
+            return val
     return None
 
 

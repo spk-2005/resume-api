@@ -1,0 +1,11 @@
+{
+  "name": "resume-api",
+  "version": "1.0.0",
+  "description": "Resume ATS Intelligence API",
+  "main": "main.py",
+  "scripts": {
+    "start": "uvicorn main:app --reload"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

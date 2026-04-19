@@ -191,10 +191,10 @@ def compute_ats_score(
     - Writing quality signals candidate quality (5 pts)
     - Title multiplier: missing title alignment = strong signal of mismatch
     """
-    skill_pts   = round(min(skill_pct * 0.38, 38.0), 2)
-    bm25_pts    = round(min(bm25_score * 0.17, 17.0), 2)
+    skill_pts   = round(min(skill_pct * 0.35, 35.0), 2)
+    bm25_pts    = round(min(bm25_score * 0.15, 15.0), 2)
     section_pts = round(min(section_pct * 0.15, 15.0), 2)
-    exp_pts     = round(min(exp_score * 12.0, 12.0), 2)
+    exp_pts     = round(min(exp_score * 20.0, 20.0), 2)
     fmt_pts     = round(min(format_pts, 10.0), 2)
     writ_pts    = round(min(writing_pts, 5.0), 2)
 
@@ -205,10 +205,10 @@ def compute_ats_score(
     total = round(min(raw * multiplier, 100.0), 1)
 
     display = {
-        "Skill Match (NLP-Weighted)    [max 38]": f"{skill_pts:5.1f} / 38",
-        "Semantic Similarity (BM25)    [max 17]": f"{bm25_pts:5.1f} / 17",
+        "Skill Match (NLP-Weighted)    [max 35]": f"{skill_pts:5.1f} / 35",
+        "Semantic Similarity (BM25)    [max 15]": f"{bm25_pts:5.1f} / 15",
         "Section Completeness          [max 15]": f"{section_pts:5.1f} / 15",
-        "Experience Match              [max 12]": f"{exp_pts:5.1f} / 12",
+        "Experience Match              [max 20]": f"{exp_pts:5.1f} / 20",
         "Format & Contact Info         [max 10]": f"{fmt_pts:5.1f} / 10",
         "Writing Quality               [max  5]": f"{writ_pts:5.1f} / 5",
         "Title Alignment Multiplier          ": f"× {multiplier:.3f}",
@@ -635,21 +635,28 @@ def _generate_insights(
     placement_missing = skill_placement.get("jd_skills_only_in_experience", [])
     if placement_missing:
         quick_wins.append(
-            f"Move these skills to your Skills section for better ATS parsing: "
-            f"{', '.join(placement_missing[:5])}"
+            f"🚀 Move these critical skills to your 'Skills' section: {', '.join(placement_missing[:3])}. "
+            f"ATS systems may skip them if they only appear in job descriptions."
         )
     if miss_secs:
         critical = [s for s in miss_secs if s in ["summary", "skills", "contact"]]
         if critical:
-            quick_wins.append(f"Add missing critical sections: {', '.join(critical)}")
-    if missing_skills[:3]:
-        quick_wins.append(
-            f"Add these high-priority missing skills if you have them: "
-            f"{', '.join(missing_skills[:3])}"
-        )
+            quick_wins.append(f"🛠️ Add these missing structural sections immediately: {', '.join(critical)}")
+    
+    if missing_skills:
+        high_val = missing_skills[:3]
+        quick_wins.append(f"💡 Priority: Add '{', '.join(high_val)}' to your resume if you have experience with them.")
+
     if writing["quantified_achievements"]["count"] < 3:
         quick_wins.append(
-            "Add 3–5 quantified achievements (%, $, team size, users) to your experience bullets"
+            "📈 Quantify your impact! Add at least 3–5 bullets with metrics (%, $, users, or time saved) "
+            "to demonstrate your value to recruiters."
+        )
+    
+    if writing["power_verbs"]["count"] < 8:
+        quick_wins.append(
+            "⚡ Replace passive language with action verbs like 'Architected', 'Spearheaded', or 'Optimized' "
+            "to sound more decisive."
         )
 
     return {
