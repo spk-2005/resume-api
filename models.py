@@ -1,6 +1,6 @@
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Index
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -45,12 +45,16 @@ class UsageLog(Base):
     # ── THIS IS THE CRITICAL COLUMN ──────────────────────────────
     # request_time is used to count how many requests this month.
     # It MUST default to datetime.utcnow so every log row is timestamped.
-    request_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    request_time = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
     endpoint     = Column(String, default="unknown")   # which endpoint was called
     status       = Column(String, default="success")   # success / error
 
     user = relationship("User", back_populates="usage_logs")
+
+    __table_args__ = (
+        Index('idx_user_request_time', 'user_id', 'request_time'),
+    )
 
     def __repr__(self):
         return f"<UsageLog user_id={self.user_id} time={self.request_time}>"

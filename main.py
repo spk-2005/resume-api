@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 from models import Base, User, APIKey, UsageLog
 from services.resume_analyzer import analyze_resume
+from fastapi.concurrency import run_in_threadpool
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -183,11 +184,12 @@ def get_db():
 
 def _count_usage_this_month(user_id: int, db: Session) -> int:
     now = datetime.utcnow()
+    # Range-based query is more index-friendly than extract()
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     try:
         return db.query(UsageLog).filter(
             UsageLog.user_id == user_id,
-            extract("year",  UsageLog.request_time) == now.year,
-            extract("month", UsageLog.request_time) == now.month,
+            UsageLog.request_time >= start_of_month
         ).count()
     except Exception as e:
         logger.error(f"Error counting usage for user {user_id}: {e}")
@@ -461,7 +463,10 @@ async def analyze_resume_endpoint(
 
         text   = extract_text(raw_bytes, resume_file.filename)
         name   = candidate_name or filename_to_name(resume_file.filename)
-        result = analyze_resume(
+
+        # Use run_in_threadpool for CPU-bound NLP task
+        result = await run_in_threadpool(
+            analyze_resume,
             resume_text=text,
             job_description=job_description,
             candidate_name=name,
@@ -469,6 +474,9 @@ async def analyze_resume_endpoint(
 
         log_usage(user.id, endpoint="/analyze-resume/", db=db)
 
+        # Optimization: We already know the used count from get_rapidapi_user flow, 
+        # but to keep it simple and accurate (reflecting the log just added), 
+        # we call it once here.
         used = _count_usage_this_month(user.id, db)
         result["usage"] = {
             "requests_used":      used,
@@ -569,13 +577,23 @@ async def bulk_analyze(
                     continue
 
                 text   = extract_text(raw_bytes, fname)
-                report = analyze_resume(
+                # Use run_in_threadpool for CPU-bound NLP task
+                report = await run_in_threadpool(
+                    analyze_resume,
                     resume_text=text,
                     job_description=job_description,
                     candidate_name=filename_to_name(fname),
                 )
                 results.append(report)
-                log_usage(user.id, endpoint="/bulk-analyze/", db=db)
+                
+                # Batch usage logging: add but don't commit in loop
+                db.add(UsageLog(
+                    user_id=user.id,
+                    request_time=datetime.utcnow(),
+                    endpoint="/bulk-analyze/",
+                    status="success",
+                ))
+                
                 logger.info(f"bulk-analyze: processed {fname} score={report.get('ats_score', {}).get('score')}")
 
             except HTTPException as e:
@@ -584,6 +602,14 @@ async def bulk_analyze(
             except Exception as e:
                 logger.error(f"bulk-analyze: error on {fname}: {traceback.format_exc()}")
                 errors.append({"file": fname, "error": str(e)})
+
+        # Commit all usage logs at once
+        if results:
+            try:
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to commit bulk usage: {e}")
+                db.rollback()
 
         if not results and errors:
             raise HTTPException(
