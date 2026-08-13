@@ -1,17 +1,31 @@
-from pydantic import BaseModel
+"""
+schemas.py ─ Pydantic models for API request/response validation.
+"""
+
+from pydantic import BaseModel, ConfigDict, EmailStr
 from typing import Optional
 
 
-class ResumeRequest(BaseModel):
-    resume_text: str
-    job_description: str
-    candidate_name: Optional[str] = None
+# ─── User & Auth Schemas ──────────────────────────────────────────
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "resume_text": "Experienced Python developer with 3 years using FastAPI, PostgreSQL, Docker and AWS. Built ML pipelines with scikit-learn and pandas.",
-                "job_description": "Looking for a backend engineer with Python, FastAPI, Docker, AWS, and SQL experience. Machine learning knowledge is a plus.",
-                "candidate_name": "Rahul Sharma"
-            }
-        }
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: EmailStr
+    plan: str
+    monthly_limit: int
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    email: Optional[str] = None

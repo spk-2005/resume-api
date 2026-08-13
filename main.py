@@ -7,21 +7,26 @@ import os
 import logging
 import tempfile
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import (
-    FastAPI, Depends, HTTPException,
-    UploadFile, File, Form, Request
+    FastAPI, APIRouter, Depends, HTTPException,
+    UploadFile, File, Form, Request, status
 )
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import extract
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, engine
-from models import Base, User, APIKey, UsageLog
+import requests
+import re
+from database import SessionLocal, engine, get_db
+import models, schemas
 from services.resume_analyzer import analyze_resume
+from services.auth import create_access_token, get_current_user, get_password_hash, verify_password, ACCESS_TOKEN_EXPIRE_MINUTES
 from fastapi.concurrency import run_in_threadpool
 
 
@@ -82,22 +87,13 @@ except ImportError:
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════
 
-RAPIDAPI_PROXY_SECRET = os.environ.get("RAPIDAPI_PROXY_SECRET", "")
-
-PLAN_LIMITS = {
-    "BASIC":  50,
-    "PRO":    500,
-    "ULTRA":  2000,
-    "MEGA":   10000,
-    "CUSTOM": 99999,
-}
-
 PDF_EXTS   = {".pdf"}
 DOCX_EXTS  = {".docx"}
 DOC_EXTS   = {".doc"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
-TEXT_EXTS  = {".txt"}
-ALL_SUPPORTED = PDF_EXTS | DOCX_EXTS | DOC_EXTS | IMAGE_EXTS | TEXT_EXTS
+TEXT_EXTS  = {".txt", ".md", ".rtf", ".csv"}
+HTML_EXTS  = {".html", ".htm"}
+ALL_SUPPORTED = PDF_EXTS | DOCX_EXTS | DOC_EXTS | IMAGE_EXTS | TEXT_EXTS | HTML_EXTS
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -109,9 +105,23 @@ app = FastAPI(
     version="3.0.0",
 )
 
+# Enable CORS for frontend development and production
+_cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in _cors_origins.split(",") if origin.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # Create all DB tables on startup
 try:
-    Base.metadata.create_all(bind=engine)
+    models.Base.metadata.create_all(bind=engine)
     logger.info("Database tables created/verified OK.")
 except Exception as e:
     logger.error(f"FATAL: Could not create DB tables: {e}")
@@ -170,12 +180,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 #  DB
 # ══════════════════════════════════════════════════════════════════
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def _ats_score_value(report: dict) -> float:
+    """Extract numeric ATS score from analyzer report."""
+    scores = report.get("scores") or {}
+    ats = scores.get("ats_score") or {}
+    return float(ats.get("value") or 0)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -187,18 +196,18 @@ def _count_usage_this_month(user_id: int, db: Session) -> int:
     # Range-based query is more index-friendly than extract()
     start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     try:
-        return db.query(UsageLog).filter(
-            UsageLog.user_id == user_id,
-            UsageLog.request_time >= start_of_month
+        return db.query(models.UsageLog).filter(
+            models.UsageLog.user_id == user_id,
+            models.UsageLog.request_time >= start_of_month
         ).count()
     except Exception as e:
-        logger.error(f"Error counting usage for user {user_id}: {e}")
+        logger.error(f"Error counting usage for user {user_id}: {e}", exc_info=True)
         return 0
 
 
 def log_usage(user_id: int, endpoint: str, db: Session):
     try:
-        db.add(UsageLog(
+        db.add(models.UsageLog(
             user_id=user_id,
             request_time=datetime.utcnow(),
             endpoint=endpoint,
@@ -212,118 +221,45 @@ def log_usage(user_id: int, endpoint: str, db: Session):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  AUTH + LIMIT ENFORCEMENT
+#  AUTH ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
 
-def get_rapidapi_user(request: Request, db: Session = Depends(get_db)) -> User:
-    try:
-        # Step 1: Proxy secret
-        incoming_secret = request.headers.get("x-rapidapi-proxy-secret", "")
-        if RAPIDAPI_PROXY_SECRET and incoming_secret != RAPIDAPI_PROXY_SECRET:
-            logger.warning(f"Invalid proxy secret from {request.client.host}")
-            raise HTTPException(
-                status_code=403,
-                detail="Forbidden. This API must be called through RapidAPI.",
-            )
+auth_router = APIRouter(tags=["Authentication"])
 
-        # Step 2: RapidAPI username
-        rapidapi_user = request.headers.get("x-rapidapi-user", "").strip()
-        if not rapidapi_user:
-            logger.warning("Request missing x-rapidapi-user header")
-            raise HTTPException(
-                status_code=401,
-                detail="Unauthorized. Subscribe to this API on RapidAPI to get access.",
-            )
-
-        # Step 3: Plan & limit
-        subscription  = request.headers.get("x-rapidapi-subscription", "BASIC").strip().upper()
-        monthly_limit = PLAN_LIMITS.get(subscription, 50)
-        logger.info(f"Request from user={rapidapi_user} plan={subscription} limit={monthly_limit}")
-
-        # Step 4: Auto-create / sync user
-        user = db.query(User).filter(User.email == rapidapi_user).first()
-        if not user:
-            logger.info(f"New user detected, creating record: {rapidapi_user}")
-            user = User(
-                email=rapidapi_user,
-                plan=subscription.lower(),
-                monthly_limit=monthly_limit,
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-        else:
-            if user.plan != subscription.lower() or user.monthly_limit != monthly_limit:
-                logger.info(f"Updating plan for {rapidapi_user}: {user.plan} → {subscription.lower()}")
-                user.plan          = subscription.lower()
-                user.monthly_limit = monthly_limit
-                db.commit()
-
-        # Step 5: Count usage
-        used = _count_usage_this_month(user.id, db)
-        logger.info(f"User {rapidapi_user} used {used}/{monthly_limit} requests this month")
-
-        # Step 6: Enforce limit
-        if used >= user.monthly_limit:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error":              "Monthly request limit reached.",
-                    "plan":               user.plan.upper(),
-                    "limit":              user.monthly_limit,
-                    "used":               used,
-                    "remaining":          0,
-                    "resets":             "1st of next month (UTC)",
-                    "upgrade":            "Visit RapidAPI to upgrade your plan.",
-                },
-            )
-
-        return user
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in get_rapidapi_user: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Auth error: {str(e)}")
+@auth_router.post("/register", response_model=schemas.UserResponse)
+def register_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_password = get_password_hash(user.password)
+    new_user = models.User(email=user.email, hashed_password=hashed_password) # Assumes User model has hashed_password
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return schemas.UserResponse.model_validate(new_user)
 
 
-# ══════════════════════════════════════════════════════════════════
-#  DEBUG ENDPOINT  (remove after debugging is done)
-# ══════════════════════════════════════════════════════════════════
-
-@app.get("/debug/", include_in_schema=False)
-async def debug(request: Request):
-    """
-    Call this through RapidAPI to see exactly what headers are arriving.
-    Delete this endpoint once everything is working.
-    """
-    return {
-        "headers_received": dict(request.headers),
-        "rapidapi_user":    request.headers.get("x-rapidapi-user", "NOT FOUND"),
-        "rapidapi_plan":    request.headers.get("x-rapidapi-subscription", "NOT FOUND"),
-        "proxy_secret_set": bool(RAPIDAPI_PROXY_SECRET),
-        "proxy_secret_ok":  request.headers.get("x-rapidapi-proxy-secret", "") == RAPIDAPI_PROXY_SECRET
-                            if RAPIDAPI_PROXY_SECRET else "PROXY_SECRET_NOT_SET_IN_ENV",
-        "db_ok":            _check_db(),
-        "imports": {
-            "pypdf":        PYPDF_OK,
-            "pdf2image":    OCR_OK,
-            "python_docx":  DOCX_OK,
-            "textract":     TEXTRACT_OK,
-            "pillow":       PIL_OK,
-        },
-    }
+@auth_router.post("/login", response_model=schemas.Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
-def _check_db() -> str:
-    try:
-        db = SessionLocal()
-        db.execute(__import__("sqlalchemy").text("SELECT 1"))
-        db.close()
-        return "OK"
-    except Exception as e:
-        return f"ERROR: {e}"
+@app.get("/users/me", response_model=schemas.UserResponse, tags=["Users"])
+def read_users_me(current_user: models.User = Depends(get_current_user)):
+    return schemas.UserResponse.model_validate(current_user)
 
+app.include_router(auth_router, prefix="/auth")
 
 # ══════════════════════════════════════════════════════════════════
 #  TEXT EXTRACTION
@@ -412,9 +348,91 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
     if ext in DOCX_EXTS:   return _extract_docx(file_bytes, filename)
     if ext in DOC_EXTS:    return _extract_doc(file_bytes, filename)
     if ext in IMAGE_EXTS:  return _extract_image(file_bytes, filename)
+    
+    # Generic fallback using textract if available
+    if TEXTRACT_OK:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            text = textract.process(tmp_path).decode("utf-8", errors="replace").strip()
+            os.unlink(tmp_path)
+            if text: return text
+        except Exception as e:
+            logger.warning(f"Textract fallback failed for {filename}: {e}")
+            
+    if ext in HTML_EXTS:
+        text = file_bytes.decode("utf-8", errors="replace")
+        text = re.sub(r'<[^>]+>', ' ', text)
+        return re.sub(r'\s+', ' ', text).strip()
+
     raise HTTPException(
         status_code=415,
         detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(ALL_SUPPORTED))}",
+    )
+
+
+def _extract_from_url(url: str) -> str:
+    """Scrapes text from a job posting URL."""
+    try:
+        logger.info(f"Scraping JD from URL: {url}")
+        # Using a browser-like User-Agent to avoid some basic anti-bot measures
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(url, timeout=15, headers=headers)
+        response.raise_for_status()
+        
+        # Simple HTML extraction
+        html = response.text
+        # Remove scripts and styles
+        html = re.sub(r'<(script|style|header|footer|nav)[^>]*>.*?</\1>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+        # Remove all other tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        if len(text) < 50:
+            raise ValueError("Extracted text too short (likely blocked or empty page).")
+        return text
+    except Exception as e:
+        logger.error(f"Failed to scrape URL {url}: {e}")
+        raise HTTPException(
+            status_code=422, 
+            detail=f"Could not extract text from the provided URL. Please paste the text directly. Error: {str(e)}"
+        )
+
+
+async def _resolve_jd(
+    job_description: Optional[str] = None,
+    jd_file: Optional[UploadFile] = None,
+    jd_url: Optional[str] = None
+) -> str:
+    """Intelligently resolves JD from text, file, or URL."""
+    # 1. Check if it's a URL in the text field
+    jd_text = (job_description or "").strip()
+    if jd_text.startswith(("http://", "https://")) and len(jd_text.split()) == 1:
+        return _extract_from_url(jd_text)
+    
+    # 2. Use URL field if provided
+    if jd_url and jd_url.strip():
+        return _extract_from_url(jd_url.strip())
+    
+    # 3. Use File if provided
+    if jd_file:
+        try:
+            content = await jd_file.read()
+            return extract_text(content, jd_file.filename)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Failed to process job description file: {e}")
+
+    # 4. Use Text if provided
+    if jd_text:
+        return jd_text
+    
+    raise HTTPException(
+        status_code=422, 
+        detail="Job description is missing. Provide 'job_description' (text/url), 'jd_file', or 'jd_url'."
     )
 
 
@@ -448,14 +466,34 @@ def _collect_files(form) -> List[UploadFile]:
 )
 async def analyze_resume_endpoint(
     request:         Request,
-    job_description: str           = Form(...),
+    job_description: Optional[str] = Form(None),
     resume_file:     UploadFile    = File(...),
+    jd_file:         Optional[UploadFile] = File(None),
+    jd_url:          Optional[str] = Form(None),
     candidate_name:  Optional[str] = Form(None),
-    user: User    = Depends(get_rapidapi_user),
+    user: models.User = Depends(get_current_user),
     db:   Session = Depends(get_db),
 ):
     try:
         logger.info(f"analyze-resume called by user_id={user.id} file={resume_file.filename}")
+
+        # --- Usage Limit Check ---
+        used = _count_usage_this_month(user.id, db)
+        if used >= user.monthly_limit:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error":              "Monthly request limit reached.",
+                    "plan":               user.plan.upper(),
+                    "limit":              user.monthly_limit,
+                    "used":               used,
+                    "remaining":          0,
+                    "resets":             "1st of next month (UTC)",
+                },
+            )
+
+        # Resolve Job Description from any format
+        jd_text = await _resolve_jd(job_description, jd_file, jd_url)
 
         raw_bytes = await resume_file.read()
         if not raw_bytes:
@@ -468,16 +506,13 @@ async def analyze_resume_endpoint(
         result = await run_in_threadpool(
             analyze_resume,
             resume_text=text,
-            job_description=job_description,
+            job_description=jd_text,
             candidate_name=name,
         )
 
         log_usage(user.id, endpoint="/analyze-resume/", db=db)
 
-        # Optimization: We already know the used count from get_rapidapi_user flow, 
-        # but to keep it simple and accurate (reflecting the log just added), 
-        # we call it once here.
-        used = _count_usage_this_month(user.id, db)
+        used += 1 # Reflect the current request in the response
         result["usage"] = {
             "requests_used":      used,
             "requests_limit":     user.monthly_limit,
@@ -485,7 +520,7 @@ async def analyze_resume_endpoint(
             "plan":               user.plan.upper(),
         }
 
-        logger.info(f"analyze-resume success for user_id={user.id} score={result.get('ats_score', {}).get('score')}")
+        logger.info(f"analyze-resume success for user_id={user.id} score={_ats_score_value(result)}")
         return result
 
     except HTTPException:
@@ -522,8 +557,8 @@ async def analyze_resume_endpoint(
 )
 async def bulk_analyze(
     request: Request,
-    user: User    = Depends(get_rapidapi_user),
-    db:   Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+    db:   Session      = Depends(get_db),
 ):
     try:
         logger.info(f"bulk-analyze called by user_id={user.id}")
@@ -533,9 +568,12 @@ async def bulk_analyze(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Could not parse form data: {e}")
 
-        job_description = form.get("job_description", "").strip()
-        if not job_description:
-            raise HTTPException(status_code=422, detail="Field 'job_description' is required.")
+        # Resolve JD from form fields
+        jd_text = await _resolve_jd(
+            job_description=form.get("job_description"),
+            jd_file=form.get("jd_file"),
+            jd_url=form.get("jd_url")
+        )
 
         resume_files = _collect_files(form)
         logger.info(f"bulk-analyze: {len(resume_files)} files received, fields={list(form.keys())}")
@@ -561,7 +599,6 @@ async def bulk_analyze(
                     "files_sent":          len(resume_files),
                     "requests_remaining":  remaining,
                     "plan":                user.plan.upper(),
-                    "tip":                 "Upload fewer files or upgrade your plan on RapidAPI.",
                 },
             )
 
@@ -581,20 +618,20 @@ async def bulk_analyze(
                 report = await run_in_threadpool(
                     analyze_resume,
                     resume_text=text,
-                    job_description=job_description,
+                    job_description=jd_text,
                     candidate_name=filename_to_name(fname),
                 )
                 results.append(report)
                 
                 # Batch usage logging: add but don't commit in loop
-                db.add(UsageLog(
+                db.add(models.UsageLog(
                     user_id=user.id,
                     request_time=datetime.utcnow(),
                     endpoint="/bulk-analyze/",
                     status="success",
                 ))
                 
-                logger.info(f"bulk-analyze: processed {fname} score={report.get('ats_score', {}).get('score')}")
+                logger.info(f"bulk-analyze: processed {fname} score={_ats_score_value(report)}")
 
             except HTTPException as e:
                 logger.warning(f"bulk-analyze: skipping {fname} — {e.detail}")
@@ -617,8 +654,8 @@ async def bulk_analyze(
                 detail={"message": "All files failed to process.", "errors": errors},
             )
 
-        ranked      = sorted(results, key=lambda r: r["ats_score"]["score"], reverse=True)
-        shortlisted = [r for r in ranked if r["ats_score"]["score"] >= 70]
+        ranked      = sorted(results, key=_ats_score_value, reverse=True)
+        shortlisted = [r for r in ranked if _ats_score_value(r) >= 70]
         final_used  = _count_usage_this_month(user.id, db)
 
         return {
@@ -628,7 +665,7 @@ async def bulk_analyze(
                 "failed":                len(errors),
                 "shortlisted_above_70":  len(shortlisted),
                 "top_candidate":         ranked[0]["candidate"]["name"] if ranked else None,
-                "top_ats_score":         ranked[0]["ats_score"]["score"] if ranked else None,
+                "top_ats_score":         _ats_score_value(ranked[0]) if ranked else None,
             },
             "usage": {
                 "requests_used":      final_used,
@@ -640,15 +677,16 @@ async def bulk_analyze(
                 {
                     "rank":                i + 1,
                     "candidate":           r["candidate"],
-                    "ats_score":           r["ats_score"],
+                    "scores":              r["scores"],
                     "skill_analysis":      r["skill_analysis"],
-                    "keyword_density":     r["keyword_density"],
+                    "jd_keyword_analysis": r["jd_keyword_analysis"],
                     "section_analysis":    r["section_analysis"],
                     "experience":          r["experience"],
                     "education":           r["education"],
                     "job_title_alignment": r["job_title_alignment"],
                     "writing_quality":     r["writing_quality"],
                     "format_and_contact":  r["format_and_contact"],
+                    "ai_insights":         r.get("ai_insights"),
                 }
                 for i, r in enumerate(ranked)
             ],

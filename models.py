@@ -1,6 +1,6 @@
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Index
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Index, Text, JSON
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -10,30 +10,16 @@ class User(Base):
 
     id            = Column(Integer, primary_key=True, index=True)
     email         = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=True) # Nullable for users created via old system
     plan          = Column(String, default="basic")           # basic / pro / ultra / mega
     monthly_limit = Column(Integer, default=50)               # max requests per month
     is_active     = Column(Boolean, default=True)
     created_at    = Column(DateTime, default=datetime.utcnow)
 
-    api_keys   = relationship("APIKey",   back_populates="user", cascade="all, delete")
     usage_logs = relationship("UsageLog", back_populates="user", cascade="all, delete")
 
     def __repr__(self):
         return f"<User id={self.id} email={self.email} plan={self.plan} limit={self.monthly_limit}>"
-
-
-class APIKey(Base):
-    __tablename__ = "api_keys"
-
-    id         = Column(Integer, primary_key=True, index=True)
-    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
-    api_key    = Column(String, unique=True, index=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="api_keys")
-
-    def __repr__(self):
-        return f"<APIKey user_id={self.user_id}>"
 
 
 class UsageLog(Base):
@@ -58,3 +44,43 @@ class UsageLog(Base):
 
     def __repr__(self):
         return f"<UsageLog user_id={self.user_id} time={self.request_time}>"
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id                      = Column(Integer, primary_key=True, index=True)
+    user_id                 = Column(Integer, ForeignKey("users.id"), nullable=False)
+    raw_text                = Column(Text, nullable=False)
+    structured_requirements = Column(JSON, nullable=True) # Stores the output of the JD Analyzer
+    created_at              = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+    def __repr__(self):
+        return f"<Job id={self.id} user_id={self.user_id}>"
+
+
+class Candidate(Base):
+    __tablename__ = "candidates"
+
+    id                = Column(Integer, primary_key=True, index=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=False)
+    raw_text          = Column(Text, nullable=False)
+    structured_evidence = Column(JSON, nullable=True) # Stores the output of the Evidence Analyzer
+    created_at        = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+    def __repr__(self):
+        return f"<Candidate id={self.id} user_id={self.user_id}>"
+
+
+class AnalysisReport(Base):
+    __tablename__ = "analysis_reports"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    job_id       = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    candidate_id = Column(Integer, ForeignKey("candidates.id"), nullable=False)
+    report_data  = Column(JSON, nullable=False) # The final evidence-backed report
+    created_at   = Column(DateTime, default=datetime.utcnow)
