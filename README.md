@@ -620,8 +620,3 @@ Verification Complete!
    - `SECRET_KEY`: A cryptographically secure random secret
    - `CORS_ORIGINS`: Your frontend URLs (e.g., `https://your-app.vercel.app`)
 
----
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
